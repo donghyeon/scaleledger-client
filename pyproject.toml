@@ -5,6 +5,8 @@ description = "The headless IoT client software for the ScaleLedger fishery auct
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "colorama>=0.4.6",
     "httpx>=0.28.1",
+    "structlog>=25.5.0",
     "tortoise-orm>=0.25.4",
 ]
