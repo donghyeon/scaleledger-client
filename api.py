@@ -28,7 +28,7 @@ class APIClient:
         response.raise_for_status()
         return response.json()
 
-    async def get_gateway_by_mac_address(self, mac_address: str) -> Dict[str, Any]:
+    async def retrieve_gateway(self, mac_address: str) -> Dict[str, Any]:
         response = await self.client.get(f"devices/api/gateways/{mac_address}/")
         response.raise_for_status()
         return response.json()
