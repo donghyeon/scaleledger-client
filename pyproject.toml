@@ -4,4 +4,7 @@ version = "0.1.0"
 description = "The headless IoT client software for the ScaleLedger fishery auction system."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "tortoise-orm>=0.25.4",
+]
