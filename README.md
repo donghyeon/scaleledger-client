@@ -1,49 +1,64 @@
 # 🐟 ScaleLedger Client
 
-**The headless IoT edge client for the ScaleLedger fishery management system.**
+**High-Frequency IoT Edge Controller for Fishery Weighing Automation**
 
-This repository contains the source code for the client-side application running on field gateway PCs. It acts as a critical bridge between physical weighing hardware (digital indicators, RFID readers) and the central ScaleLedger Django server.
+ScaleLedger Client is a **Headless IoT Edge Controller** running on gateway PCs at wholesale fishery auction sites. It acts as a critical bridge that orchestrates physical weighing hardware (SUWOL100) while maintaining real-time synchronization with the central ScaleLedger Django server.
 
-## 📖 About the Project
+## 📖 Project Overview
 
-ScaleLedger is a comprehensive platform for managing fishery auctions, weighing records, and financial settlements. While the server handles data processing and administration, this **Client** is responsible for the "Edge" operations at the actual auction site.
-
-The client is designed to run as a background system service on Windows/Linux machines connected to weighing scales via Serial (RS-232/USB) ports. It operates without a graphical user interface (Headless), focusing on **reliability**, **data integrity**, and **real-time concurrency**.
+This project is not just a passive data forwarder. It operates as a **Master Controller** for field equipment, utilizing a **PC-Driven Polling Architecture** to dominate hardware I/O. Simultaneously, it employs an **Event-Driven Sync Strategy** to ensure zero-latency data transmission to the cloud, strictly adhering to **Local-First** principles for data integrity.
 
 ## 🎯 Core Responsibilities
 
-1.  **Hardware Abstraction & FSM Logic**
-    - Establishes persistent serial connections with industrial weighing indicators.
-    - Manages the weighing lifecycle (Idle -> Measuring -> Stable) using an internal **Finite State Machine (FSM)**.
-    - Decodes raw byte streams to extract weight data and RFID tag UIDs.
+The client handles two distinct operational domains with different concurrency models:
 
-2.  **Device Identity & Security**
-    - Uniquely identifies the gateway PC using its hardware MAC address.
-    - Performs automated **Handshake & Registration** with the server to obtain access tokens.
-    - Securely stores credentials and device configurations in a local database.
+### 1. Hardware Orchestration (The Polling Domain)
+The client acts as the **Master** driver for the SUWOL100 integrated weighing system.
 
-3.  **Robust Data Synchronization**
-    - **Store-and-Forward:** Saves weighing records locally first (Local-First), then uploads them to the server asynchronously. This ensures zero data loss even during network outages.
-    - **Real-time Streaming:** Pushes weight updates via WebSockets for the live auction UI, applying **Smart Throttling** (e.g., 10Hz) to prevent network congestion.
-    - **Heartbeat:** Sends periodic health checks to report device status and connectivity.
+* **Active Polling & Data Capture**: Since the hardware does not buffer data, the client performs high-frequency polling (sub-100ms) to capture volatile RFID tags and weight data before they vanish.
+* **Feedback Control**: It actively renders visual information on the LED display and triggers voice guidance (TTS) and printer outputs based on the weighing workflow state.
+
+### 2. Reactive Cloud Synchronization (The Event Domain)
+Unlike the hardware layer, the network layer avoids polling.
+
+* **Zero-Latency Upload**: Weighing records are pushed to a transmission queue immediately upon creation, triggering an instant upload to the server without waiting for a scheduled interval.
+* **Offline Resilience**: If the network is down, the queue pauses, but data is safely secured in the local SQLite database. Upon reconnection, the system automatically replays the pending events.
+* **Identity Management**: Securely manages device identity via MAC address and auto-refreshing access tokens.
 
 ## 🏗 System Architecture
 
-The client employs a **Hybrid Asyncio-Thread Model** to ensure that blocking I/O operations never degrade the performance of the main event loop.
+To satisfy both the strict timing requirements of hardware and the asynchronous nature of network I/O, the system uses a **Producer-Consumer Pattern**:
 
-- **Serial Worker (Threaded):** A dedicated thread that continuously reads the hardware buffer (Blocking I/O) and pushes raw data into an async-safe queue.
-- **Main Controller (Asyncio):** The single-threaded event loop that orchestrates the entire application:
-    - Consumes data from the queue.
-    - Updates the FSM state.
-    - Manages HTTP REST API calls and WebSocket connections concurrently.
-- **Local Persistence:** Uses **Tortoise ORM** with SQLite to persist unsent records and configuration.
+### 1. Dedicated Hardware Thread (Producer)
+* Isolates blocking serial I/O from the main event loop.
+* Continuously polls the hardware in a tight loop (Request-Response).
+* Parses raw packets and produces "Physical Events" (e.g., RFID detected, Weight Stabilized) into a thread-safe queue.
+
+### 2. Asyncio Main Loop (Processor)
+* Operates on a **Finite State Machine (FSM)**: `INITIALIZE` → `SYNC` → `REGISTER` → `HEARTBEAT`.
+* Consumes physical events, executes business logic (e.g., deciding when to finalize a transaction), and persists data to the local database (**Tortoise ORM**).
+
+### 3. Sync Worker (Consumer)
+* A dedicated background task that monitors the **Sync Queue**.
+* As soon as the Main Loop commits a record to the DB, it pushes a task to this queue.
+* The worker consumes the task and executes the HTTP REST call to the server, ensuring immediate data synchronization.
+
+## 🔌 Hardware Interface (SUWOL100 Protocol)
+
+The client implements the full **Master-Slave protocol** for SUWOL100:
+
+* **Communication**: RS-232 Serial (9600bps).
+* **Protocol Logic**:
+    * **Request (PC → MCU)**: Sends display updates, relay control bits, and voice commands in a single packet.
+    * **Response (MCU → PC)**: Receives weight sensor data, RFID tags, and keypad inputs.
+* **Constraint**: The MCU has no memory. If the client stops polling even for a second, field data is permanently lost. Reliability is paramount.
 
 ## 🛠 Tech Stack
 
-- **Language:** Python 3.14+
-- **Package Manager:** `uv`
-- **Concurrency:** `asyncio` (Core Logic) + `threading` (Serial Read)
-- **Hardware:** `pyserial`
-- **Network:** `httpx` (Async HTTP Client), `websockets`
-- **Database:** `Tortoise ORM` (Async ORM)
-- **Logging:** `structlog`
+* **Language**: Python 3.14+
+* **Runtime Manager**: uv
+* **Core**: asyncio (Event Loop), asyncio.Queue (Data Pipeline), threading
+* **Networking**: httpx (Async HTTP), websockets
+* **Database**: Tortoise ORM (Async SQLite)
+* **Hardware**: pyserial
+* **Logging**: structlog (Structured JSON Logging)

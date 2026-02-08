@@ -1,185 +1,113 @@
-# Product Requirements Document: ScaleLedger Headless Client
+# 🐟 ScaleLedger Client Product Requirements Document (PRD)
 
-**문서 버전**: 1.0
-**작성 일자**: 2026.02.07
-
----
-
-## 1. 개요 (Overview)
-**ScaleLedger Client**는 수산물 경매 현장의 게이트웨이 PC에서 실행되는 Headless 프로그램이다. 계량기(Scale)와 RFID 리더기 같은 주변기기의 데이터를 실시간으로 수집하여 로컬에 저장하고, 중앙 서버(Django)로 안정적으로 전송하는 역할을 한다.
-
-### 1.1 주요 목표
-- **실시간성:** 계량 데이터를 지연 없이 수집하고, 필요 시 웹소켓을 통해 서버로 스트리밍한다.
-- **안정성 (Resilience):** 네트워크가 끊겨도 계량 업무는 중단되지 않아야 하며(Local First), 연결 복구 시 자동으로 데이터가 동기화되어야 한다.
-- **확장성:** `asyncio` 기반의 비동기 아키텍처를 통해 적은 리소스로 다중 통신(HTTP, WebSocket)을 처리한다.
+**문서 버전**: 2.0
+**작성 일자**: 2026.02.09
+**대상 독자**: 엣지 클라이언트 개발자, 임베디드 시스템 엔지니어
 
 ---
 
-## 2. 시스템 아키텍처 (Architecture)
+## 1. 프로젝트 개요 (Overview)
 
-### 2.1 기술 스택
-- **Language:** Python 3.14+
-- **Package Manager:** `uv` (빠른 의존성 관리 및 배포)
-- **Concurrency:** `asyncio` (Main Loop), `threading` (Serial Blocking I/O 회피)
-- **Network:** `httpx` (Async HTTP), `websockets` (Async WebSocket)
-- **Serial:** `pyserial`
-- **Local DB:** `Tortoise ORM` (Async ORM) + `SQLite` (`aiosqlite` 드라이버)
-- **Logging:** `structlog` (Structured Logging)
-- **Daemon:** Systemd (Linux) / Servy (Windows)
+### 1.1 프로젝트 정의
+**ScaleLedger Client**는 수산물 경매 현장의 게이트웨이 PC에서 실행되는 **Headless IoT Edge Controller**입니다. 중앙 서버(Django)의 정책을 수신하여 로컬 장비를 제어하고, 물리적 계량 장비(`SUWOL100`)와 고속 통신을 수행하여 계량 데이터를 확보하는 핵심 미들웨어입니다.
 
-### 2.2 구조도 (Conceptual Diagram)
-```text
-[Serial Hardware] --(UART/USB)--> [Thread: Serial Reader] 
-                                          |
-                                    (Blocking Read)
-                                          |
-                                          v
-                                   [Asyncio Queue] <--(Bridge)--+
-                                          |                     |
-                                          v                     |
-[Local DB (SQLite)] <--(Save)-- [Main Event Loop (FSM)] --------+
-                                          |
-                        +-----------------+-----------------+
-                        |                 |                 |
-                  (HTTP REST)         (WebSocket)       (Heartbeat)
-                        |                 |                 |
-                        v                 v                 v
-                 [Django Server: API & Channels]
-```
-
-### 2.3 스레딩 모델 (Hybrid Model)
-
-1. **Serial Thread (Producer):** `pyserial`의 `readline()` 같은 Blocking I/O를 전담. 데이터를 읽는 즉시 `loop.call_soon_threadsafe()`를 통해 Main Loop의 Queue로 주입.
-2. **Main Event Loop (Consumer):** 단일 스레드(Single Thread)에서 동작. Queue 처리, FSM 상태 전이, HTTP 요청, WebSocket 통신을 모두 비동기(`await`)로 처리.
+### 1.2 핵심 철학 (Core Philosophy)
+1.  **Event-Driven & Reactive (이벤트 기반 반응형)**: 하드웨어 폴링을 제외한 모든 로직(데이터 동기화, 서버 통신)은 이벤트 기반으로 동작하여 불필요한 리소스 소모를 제거합니다.
+2.  **Local-First & Sync (선 저장 후 전송)**: 모든 계량 데이터는 로컬 DB(SQLite)에 우선 저장되어야 하며, 네트워크 상태와 무관하게 현장 업무는 지속되어야 합니다.
+3.  **PC-Driven Control (PC 주도 제어)**: 연결된 계량 장비(`SUWOL100`)는 수동적인 Slave 장치입니다. 클라이언트는 전광판 표시, 음성 안내, 프린터 출력을 능동적으로 제어해야 합니다.
 
 ---
 
-## 3. 핵심 기능 요구사항 (Functional Requirements)
+## 2. 시스템 아키텍처 (System Architecture)
 
-### FR-01: 기기 등록 및 인증 (Registration & Sync)
+### 2.1 하드웨어 토폴로지
+* **Host**: Windows/Linux PC (Gateway)
+* **Target Device**: `SUWOL100` 통합 계량기 (Scale + RFID Reader + LED Display + Printer + Voice Module)
+* **Interface**: RS-232 Serial (Baudrate: 9600)
 
-프로그램 시작 시 다음의 상태 흐름을 따른다 (`ClientState`).
+### 2.2 소프트웨어 구조 (Producer-Consumer Pattern)
+데이터 흐름을 최적화하기 위해 `asyncio.Queue`를 활용한 비동기 파이프라인을 구축합니다.
 
-1. **INITIALIZE:** 로컬 DB(`Gateway` 테이블)를 확인한다. 유효한 `Access Token`이 있으면 즉시 `HEARTBEAT` 상태로 전이한다. 없으면 `SYNC` 상태로 진입한다.
-2. **SYNC:** 서버에 기기 정보(`MAC Address` 기반)를 조회한다.
-* **Not Found (404):** 서버에 등록되지 않은 기기이므로 `REGISTER` 상태로 전이한다.
-* **Pending:** 등록은 되었으나 승인 대기 중인 경우, 일정 시간 대기 후 다시 `SYNC`를 시도한다.
-* **Approved:** 서버로부터 토큰을 받아 로컬 DB에 저장하고 `HEARTBEAT` 상태로 전이한다.
-
-
-3. **REGISTER:** 서버에 신규 기기 등록 요청(`POST`)을 보낸다. 등록 성공 시 `SYNC` 상태로 돌아가 토큰 발급을 확인한다.
-
-### FR-02: 데이터 수집 및 파싱 (Data Acquisition)
-
-* 시리얼 포트로부터 들어오는 Raw Data를 파싱하여 유형(`RFID` 또는 `WEIGHT`)을 구분한다.
-* **RFID:** 태그 ID(UID) 추출.
-* **WEIGHT:** 무게 값(float) 및 단위 추출. 노이즈 필터링 필요 시 적용.
-
-### FR-03: 계량 프로세스 (FSM Logic)
-
-프로그램은 다음 상태(State)를 가진다.
-
-1. **BOOT:** 초기화 및 설정 로드.
-2. **UNREGISTERED:** 서버 등록 대기.
-3. **IDLE:** 대기 상태. RFID 태그를 기다림.
-4. **MEASURING:** 계량 중. RFID가 태그된 상태에서 무게가 안정화되기를 기다림.
-
-**[상세 로직]**
-
-* `IDLE` 상태에서 RFID 태그 감지 -> `MEASURING`으로 전이.
-* `MEASURING` 상태에서 무게 데이터 수집 (Buffer 저장).
-* 무게가 일정 시간(예: 1초) 동안 변동폭 내에서 유지되면 **"안정(Stable)"**으로 판단.
-* 안정된 무게를 **로컬 DB에 즉시 저장**(`is_sent=False`)하고 `IDLE`로 복귀.
-
-### FR-04: 데이터 동기화 (Store-and-Forward)
-
-* **백그라운드 Task**가 주기적으로(예: 5초) 로컬 DB에서 `is_sent=False`인 기록을 조회.
-* 서버 API로 전송(`POST`)하고, `201 Created` 응답을 받으면 로컬 DB의 해당 기록을 `is_sent=True`로 마킹.
-* **Idempotency:** 네트워크 오류로 재전송되더라도 중복 저장되지 않도록 `UUID`를 클라이언트에서 생성하여 보낸다.
-
-### FR-05: 실시간 스트리밍 (WebSocket Throttling)
-
-* 서버의 요청(`START_STREAM` 커맨드)이 있을 때만 무게 데이터를 전송한다.
-* **Throttling:** 시리얼 데이터(50Hz)를 그대로 보내지 않고, 최대 전송 빈도(예: 10Hz, 100ms 간격)를 설정하여 샘플링 전송한다.
-* `MEASURING` 상태 여부와 관계없이 현재 저울에 올라온 무게를 전송해야 한다.
-
-### FR-06: 헬스 체크 (Heartbeat)
-
-* 주기적(기본 30초)으로 서버로 생존 신호를 보낸다.
-* 인증 실패(401, 403) 또는 기기 삭제(404) 응답 시, 로컬 데이터를 초기화하고 `REGISTER` 상태로 돌아가 재등록 절차를 밟는다.
+1.  **Hardware Worker (Thread) - [Producer 1]**
+    * 역할: `SUWOL100` 장비와 물리적 통신 전담 (Blocking I/O 격리).
+    * 동작: 고속 폴링(Request/Response)을 수행하며, 유의미한 센서 데이터 감지 시 즉시 Main Loop로 이벤트를 발행.
+2.  **Main Controller (Asyncio Loop) - [Processor]**
+    * 역할: 비즈니스 로직(FSM) 처리.
+    * 동작: Hardware Worker의 이벤트를 받아 로컬 DB에 저장하고, 동시에 `Sync Queue`에 작업을 발행(Put).
+3.  **Sync Worker (Asyncio Task) - [Consumer]**
+    * 역할: 서버 데이터 동기화 전담.
+    * 동작: `Sync Queue`를 대기(`await get()`)하다가 데이터가 들어오는 즉시 서버로 업로드. 성공 시 DB 상태 업데이트.
 
 ---
 
-## 4. 데이터베이스 스키마 (Local SQLite)
+## 3. 하드웨어 인터페이스 요구사항 (Hardware Driver)
 
-### 4.1 `gateway`
+클라이언트는 `SUWOL100` 프로토콜 사양(`SUWOL100.md`)을 완벽히 준수해야 합니다. **(이 영역은 물리적 제약으로 인해 Polling 방식을 유지합니다.)**
 
-기기 설정 및 인증 정보를 저장. (`Gateway` 모델)
+### 3.1 Polling & Display (Master Mode)
+* **상시 명령 전송**: 클라이언트는 IDLE 상태에서도 상시 `D` 커맨드(Display Update)를 전달하여 계량 기기 상태를 상시 확인해야 합니다.
+* **전광판 제어**: 현재 상태(대기중, 계량중, 완료 등)에 따라 전광판에 표시될 텍스트를 동적으로 렌더링합니다.
+
+### 3.2 Input Capture (Volatile Data)
+* **휘발성 데이터 방어**: `SUWOL100`의 입력값(RFID, Keypad)은 1회 전송 후 소멸되므로, Hardware Worker는 응답 패킷을 파싱하여 데이터 존재 시 즉시 캡처해야 합니다.
+
+---
+
+## 4. 상세 기능 명세 (Detailed Specifications)
+
+### 4.1 상태 관리 (Finite State Machine)
+1.  **INITIALIZE**: 부팅 직후 로컬 DB 점검.
+2.  **SYNC**: 서버 등록 상태 확인 및 토큰 갱신.
+3.  **REGISTER**: 신규 기기 등록 프로세스.
+4.  **HEARTBEAT**: 정상 운영 상태. (30초 주기 생존 신고)
+
+### 4.2 계량 및 저장 프로세스 (Weighing Logic)
+1.  **측정 완료 (Completed)**:
+    * RFID 인식 및 중량 안정화 조건 만족 시 발생.
+2.  **로컬 저장 (Persistence)**:
+    * `WeighingRecord`를 SQLite에 저장 (`is_synced=False`).
+3.  **큐 주입 (Enqueue)**:
+    * 저장된 레코드 객체를 즉시 `asyncio.Queue`에 `put_nowait()`으로 주입.
+
+### 4.3 데이터 동기화 (Event-Driven Sync Strategy)
+**Polling을 금지하며**, 큐(Queue)를 이용한 즉시 전송 방식을 사용합니다.
+
+1.  **Boot & Reconnect Strategy (Recovery)**:
+    * 프로그램 시작 시 또는 네트워크 재연결 시, 로컬 DB에서 `is_synced=False`인 모든 기록을 조회하여 `Sync Queue`에 일괄 주입합니다.
+2.  **Real-time Upload (Consumer Loop)**:
+    * `Sync Worker`는 큐에서 데이터를 하나씩 꺼내(`await queue.get()`) 서버 API로 전송합니다.
+    * **Success**: 전송 성공 시(`201 Created`), 로컬 DB의 해당 레코드를 `is_synced=True`로 업데이트합니다.
+    * **Failure**: 네트워크 오류 발생 시, 해당 아이템을 다시 큐에 넣거나(Re-queue with delay), 다음 재연결 이벤트까지 보류합니다.
+
+---
+
+## 5. 데이터 모델링 (Local SQLite Schema)
+
+### 5.1 Gateway (기기 설정)
 | Field | Type | Description |
 |---|---|---|
-| `mac_address` | VARCHAR(17) | MAC 주소 (PK) |
-| `hostname` | VARCHAR(255) | 호스트명 |
-| `ip_address` | VARCHAR(15) | IP 주소 |
-| `access_token` | VARCHAR(64) | API 인증 토큰 |
-| `status` | VARCHAR(10) | 기기 상태 (Active, Inactive 등) |
-| `last_heartbeat` | DATETIME | 마지막 통신 시각 |
-| `created_at` | DATETIME | 생성 시각 |
-| `updated_at` | DATETIME | 수정 시각 |
+| `mac_address` | TEXT (PK) | 기기 고유 ID |
+| `access_token` | TEXT | API 인증 토큰 |
+| `status` | TEXT | 등록 상태 |
+| `heartbeat_interval` | INT | 서버 설정값 |
 
-### 4.2 `weighing_records`
-
-계량된 실적을 저장. (`WeighingRecord` 모델 예정)
+### 5.2 WeighingRecord (계량 기록)
 | Field | Type | Description |
 |---|---|---|
-| `uuid` | CHAR(36) | 고유 ID (PK) |
-| `rfid_uid` | VARCHAR(50) | 태그된 RFID |
-| `weight` | FLOAT | 측정 무게 |
-| `measured_at` | DATETIME | 측정 시각 |
-| `is_sent` | BOOLEAN | 서버 전송 여부 (Index) |
+| `uuid` | TEXT (PK) | 고유 식별자 (UUID v4) |
+| `rfid_uid` | TEXT | 태그된 RFID 값 |
+| `weight` | INT | 측정 중량 (kg) |
+| `measured_at` | DATETIME | 측정 완료 시각 |
+| `is_synced` | BOOLEAN | 서버 전송 여부 (Index) |
+| `created_at` | DATETIME | 로컬 생성 시각 |
 
 ---
 
-## 5. 인터페이스 명세 (Server API Contract)
+## 6. 비기능 요구사항 (NFR)
 
-Django 서버(`devices`, `weighing` 앱)는 다음 API를 제공해야 한다.
-
-### 5.1 기기 관리 (`devices`)
-
-* `GET devices/api/gateways/{mac_address}/`
-* 기기 상태 및 토큰 발급 여부 확인 (Sync).
-* `POST devices/api/gateways/`
-* 신규 기기 등록 요청.
-* **Body:** `{ "mac_address": "...", "hostname": "...", "ip_address": "...", "name": "..." }`
-* `POST devices/api/gateways/heartbeat/`
-* 생존 신고.
-* **Header:** `Authorization: Bearer {access_token}`
-
-### 5.2 계량 처리 (`weighing`)
-
-* `POST api/weighing/records/` (예정)
-* 계량 기록 업로드.
-* **Body:** `{uuid, rfid_uid, weight, measured_at}`
-
-### 5.3 웹소켓 채널
-
-* URL: `ws://{server}/ws/devices/{gateway_id}/`
-* **Client -> Server:** `{"type": "weight_update", "value": 10.5}`
-* **Server -> Client:** `{"type": "START_STREAM"}`, `{"type": "STOP_STREAM"}`
-
----
-
-## 6. 배포 및 운영 전략 (Deployment)
-
-### 6.1 설치 자동화
-
-* **Windows:** `install_win.ps1`
-* `winget`으로 Git, Python 설치 확인.
-* `Servy`를 통해 Windows Service로 등록.
-* **Linux:** `install_linux.sh`
-* `apt` 패키지 설치.
-* `systemd` unit 파일 생성 및 등록.
-
-### 6.2 업데이트
-
-* 서비스 재시작 시 자동으로 `git pull`을 수행하도록 스크립트 구성 (선택 사항) 또는 별도 업데이트 명령어 제공.
-* `uv sync`를 통해 의존성 최신화.
+1.  **Zero Latency Sync**:
+    * 계량 완료 후 서버와의 데이터 동기화를 위해 별도의 Worker로 넘겨 빠르게 작업을 마무리 하며, 다른 작업들에 방해가 되지 않도록 합니다.
+2.  **Concurrency Safety**:
+    * Hardware Thread와 Asyncio Loop 간의 데이터 교환은 반드시 `Thread-Safe Queue`를 통해 이루어져야 합니다.
+3.  **Graceful Shutdown**:
+    * 프로그램 종료 시 `Sync Queue`에 남아있는 데이터는 처리하지 않고 종료해도 무방합니다(데이터는 이미 로컬 DB에 안전하게 저장되어 있으며, 다음 부팅 시 Recovery 로직에 의해 처리됨).
