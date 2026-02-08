@@ -1,5 +1,10 @@
 # Product Requirements Document: ScaleLedger Headless Client
 
+**문서 버전**: 1.0
+**작성 일자**: 2026.02.07
+
+---
+
 ## 1. 개요 (Overview)
 **ScaleLedger Client**는 수산물 경매 현장의 게이트웨이 PC에서 실행되는 Headless 프로그램이다. 계량기(Scale)와 RFID 리더기 같은 주변기기의 데이터를 실시간으로 수집하여 로컬에 저장하고, 중앙 서버(Django)로 안정적으로 전송하는 역할을 한다.
 
@@ -13,12 +18,13 @@
 ## 2. 시스템 아키텍처 (Architecture)
 
 ### 2.1 기술 스택
-- **Language:** Python 3.12+
+- **Language:** Python 3.14+
 - **Package Manager:** `uv` (빠른 의존성 관리 및 배포)
 - **Concurrency:** `asyncio` (Main Loop), `threading` (Serial Blocking I/O 회피)
 - **Network:** `httpx` (Async HTTP), `websockets` (Async WebSocket)
 - **Serial:** `pyserial`
-- **Local DB:** `SQLAlchemy` (Async ORM) + `SQLite` (`aiosqlite` 드라이버)
+- **Local DB:** `Tortoise ORM` (Async ORM) + `SQLite` (`aiosqlite` 드라이버)
+- **Logging:** `structlog` (Structured Logging)
 - **Daemon:** Systemd (Linux) / Servy (Windows)
 
 ### 2.2 구조도 (Conceptual Diagram)
@@ -39,7 +45,6 @@
                         |                 |                 |
                         v                 v                 v
                  [Django Server: API & Channels]
-
 ```
 
 ### 2.3 스레딩 모델 (Hybrid Model)
@@ -51,12 +56,18 @@
 
 ## 3. 핵심 기능 요구사항 (Functional Requirements)
 
-### FR-01: 기기 등록 및 인증 (Registration)
+### FR-01: 기기 등록 및 인증 (Registration & Sync)
 
-* 프로그램 시작 시 로컬 DB에 `Access Token`이 있는지 확인한다.
-* 토큰이 없으면 서버에 `MAC Address`를 보내 등록 상태를 확인한다.
-* **Unregistered:** 서버에 신규 등록 요청(POST)을 보내고 승인 대기(Polling)한다.
-* **Approved:** 서버로부터 토큰을 발급받아 로컬 DB에 저장하고 `Active` 상태로 전환한다.
+프로그램 시작 시 다음의 상태 흐름을 따른다 (`ClientState`).
+
+1. **INITIALIZE:** 로컬 DB(`Gateway` 테이블)를 확인한다. 유효한 `Access Token`이 있으면 즉시 `HEARTBEAT` 상태로 전이한다. 없으면 `SYNC` 상태로 진입한다.
+2. **SYNC:** 서버에 기기 정보(`MAC Address` 기반)를 조회한다.
+* **Not Found (404):** 서버에 등록되지 않은 기기이므로 `REGISTER` 상태로 전이한다.
+* **Pending:** 등록은 되었으나 승인 대기 중인 경우, 일정 시간 대기 후 다시 `SYNC`를 시도한다.
+* **Approved:** 서버로부터 토큰을 받아 로컬 DB에 저장하고 `HEARTBEAT` 상태로 전이한다.
+
+
+3. **REGISTER:** 서버에 신규 기기 등록 요청(`POST`)을 보낸다. 등록 성공 시 `SYNC` 상태로 돌아가 토큰 발급을 확인한다.
 
 ### FR-02: 데이터 수집 및 파싱 (Data Acquisition)
 
@@ -94,26 +105,30 @@
 
 ### FR-06: 헬스 체크 (Heartbeat)
 
-* 30초마다 서버로 생존 신호를 보낸다.
-* 인증 실패(401) 시 토큰 만료로 간주하고 재인증 절차를 밟는다.
+* 주기적(기본 30초)으로 서버로 생존 신호를 보낸다.
+* 인증 실패(401, 403) 또는 기기 삭제(404) 응답 시, 로컬 데이터를 초기화하고 `REGISTER` 상태로 돌아가 재등록 절차를 밟는다.
 
 ---
 
 ## 4. 데이터베이스 스키마 (Local SQLite)
 
-### 4.1 `gateway_config`
+### 4.1 `gateway`
 
-기기 설정 및 인증 정보를 저장.
+기기 설정 및 인증 정보를 저장. (`Gateway` 모델)
 | Field | Type | Description |
 |---|---|---|
-| `key` | VARCHAR(50) | 설정 키 (PK) |
-| `value` | TEXT | 설정 값 |
-
-*Example Keys:* `access_token`, `gateway_id`, `mac_address`, `device_name`
+| `mac_address` | VARCHAR(17) | MAC 주소 (PK) |
+| `hostname` | VARCHAR(255) | 호스트명 |
+| `ip_address` | VARCHAR(15) | IP 주소 |
+| `access_token` | VARCHAR(64) | API 인증 토큰 |
+| `status` | VARCHAR(10) | 기기 상태 (Active, Inactive 등) |
+| `last_heartbeat` | DATETIME | 마지막 통신 시각 |
+| `created_at` | DATETIME | 생성 시각 |
+| `updated_at` | DATETIME | 수정 시각 |
 
 ### 4.2 `weighing_records`
 
-계량된 실적을 저장.
+계량된 실적을 저장. (`WeighingRecord` 모델 예정)
 | Field | Type | Description |
 |---|---|---|
 | `uuid` | CHAR(36) | 고유 ID (PK) |
@@ -130,26 +145,20 @@ Django 서버(`devices`, `weighing` 앱)는 다음 API를 제공해야 한다.
 
 ### 5.1 기기 관리 (`devices`)
 
-* `GET /api/devices/gateways/handshake/?mac={mac_address}`
-* 기기 상태 및 등록 여부 확인.
-
-
-* `POST /api/devices/gateways/`
-* 신규 기기 등록 요청 (Body: mac, hostname, ip).
-
-
-* `POST /api/devices/gateways/{id}/heartbeat/`
-* 생존 신고 (Auth Header 필요).
-
-
+* `GET devices/api/gateways/{mac_address}/`
+* 기기 상태 및 토큰 발급 여부 확인 (Sync).
+* `POST devices/api/gateways/`
+* 신규 기기 등록 요청.
+* **Body:** `{ "mac_address": "...", "hostname": "...", "ip_address": "...", "name": "..." }`
+* `POST devices/api/gateways/heartbeat/`
+* 생존 신고.
+* **Header:** `Authorization: Bearer {access_token}`
 
 ### 5.2 계량 처리 (`weighing`)
 
-* `POST /api/weighing/records/`
+* `POST api/weighing/records/` (예정)
 * 계량 기록 업로드.
 * **Body:** `{uuid, rfid_uid, weight, measured_at}`
-
-
 
 ### 5.3 웹소켓 채널
 
@@ -166,13 +175,9 @@ Django 서버(`devices`, `weighing` 앱)는 다음 API를 제공해야 한다.
 * **Windows:** `install_win.ps1`
 * `winget`으로 Git, Python 설치 확인.
 * `Servy`를 통해 Windows Service로 등록.
-
-
 * **Linux:** `install_linux.sh`
 * `apt` 패키지 설치.
 * `systemd` unit 파일 생성 및 등록.
-
-
 
 ### 6.2 업데이트
 

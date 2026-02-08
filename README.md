@@ -36,7 +36,7 @@ The client employs a **Hybrid Asyncio-Thread Model** to ensure that blocking I/O
     - Consumes data from the queue.
     - Updates the FSM state.
     - Manages HTTP REST API calls and WebSocket connections concurrently.
-- **Local Persistence:** Uses **SQLAlchemy (Async ORM)** with SQLite to persist unsent records and configuration.
+- **Local Persistence:** Uses **Tortoise ORM** with SQLite to persist unsent records and configuration.
 
 ## 🛠 Tech Stack
 
@@ -45,4 +45,5 @@ The client employs a **Hybrid Asyncio-Thread Model** to ensure that blocking I/O
 - **Concurrency:** `asyncio` (Core Logic) + `threading` (Serial Read)
 - **Hardware:** `pyserial`
 - **Network:** `httpx` (Async HTTP Client), `websockets`
-- **Database:** `SQLAlchemy` + `aiosqlite`
+- **Database:** `Tortoise ORM` (Async ORM)
+- **Logging:** `structlog`
