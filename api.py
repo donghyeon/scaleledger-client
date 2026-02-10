@@ -38,3 +38,9 @@ class APIClient:
         response = await self.client.post("devices/api/gateways/heartbeat/", headers=headers)
         response.raise_for_status()
         return response.json()
+
+    async def sync_peripherals(self, access_token: str, peripherals: list) -> Dict[str, Any]:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = await self.client.post("devices/api/gateways/peripherals/sync/", headers=headers, json=peripherals)
+        response.raise_for_status()
+        return response.json()

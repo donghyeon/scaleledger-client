@@ -8,7 +8,7 @@ from tortoise import Tortoise, connections
 
 from api import APIClient
 from models import Gateway
-from utils import get_mac_address, get_ip_address, get_hostname
+from utils import get_mac_address, get_ip_address, get_hostname, scan_peripherals
 
 
 def setup_logging():
@@ -86,7 +86,17 @@ class HeadlessClient:
             
             if gateway.access_token:
                 self.access_token = gateway.access_token
-                self.logger.info("sync_success_token_received", gateway_status=gateway.status)
+                self.logger.info("sync_access_token_received", gateway_status=gateway.status)
+
+                self.logger.info("scanning_peripherals")
+                peripherals = scan_peripherals()
+                self.logger.debug("peripherals_found", count=len(peripherals))
+
+                for peripheral in peripherals:
+                    peripheral["gateway"] = gateway.id
+
+                response = await self.api_client.sync_peripherals(self.access_token, peripherals)
+                self.logger.info("peripheral_sync_complete", count=len(response))
                 return ClientState.HEARTBEAT
             
             self.logger.info("sync_pending_approval", 
@@ -99,6 +109,8 @@ class HeadlessClient:
             if e.response.status_code == 404:
                 self.logger.warning("device_not_registered_on_server", next_state="REGISTER")
                 return ClientState.REGISTER
+            elif e.response.status_code == 400:
+                self.logger.error("peripheral_sync_failed", status_code=e.response.status_code, errors=e.response.text)
             raise e
 
     async def register(self) -> ClientState:
