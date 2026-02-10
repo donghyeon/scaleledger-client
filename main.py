@@ -4,7 +4,7 @@ from enum import Enum, auto
 
 import httpx
 import structlog
-from tortoise import Tortoise, connections
+from tortoise import Tortoise
 
 from api import APIClient
 from models import Gateway
@@ -53,7 +53,7 @@ class HeadlessClient:
 
     async def close(self):
         await self.api_client.close()
-        await connections.close_all()
+        await Tortoise.close_connections()
         self.logger.info("client_shutdown")
 
     async def setup(self):
@@ -89,7 +89,7 @@ class HeadlessClient:
                 self.logger.info("sync_access_token_received", gateway_status=gateway.status)
 
                 self.logger.info("scanning_peripherals")
-                peripherals = scan_peripherals()
+                peripherals = await asyncio.to_thread(scan_peripherals)
                 self.logger.debug("peripherals_found", count=len(peripherals))
 
                 for peripheral in peripherals:
