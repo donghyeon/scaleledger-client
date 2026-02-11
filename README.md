@@ -2,7 +2,7 @@
 
 **High-Frequency IoT Edge Controller for Fishery Weighing Automation**
 
-ScaleLedger Client is a **Headless IoT Edge Controller** running on gateway PCs at wholesale fishery auction sites. It acts as a critical bridge that orchestrates physical weighing hardware (SUWOL100) while maintaining real-time synchronization with the central ScaleLedger Django server.
+ScaleLedger Client is a **Headless IoT Edge Controller** running on gateway PCs at wholesale fishery auction sites. It acts as a critical bridge that orchestrates physical weighing hardware (`SUWOL-1000`) while maintaining real-time synchronization with the central ScaleLedger Django server.
 
 ## 📖 Project Overview
 
@@ -13,7 +13,7 @@ This project is not just a passive data forwarder. It operates as a **Master Con
 The client handles two distinct operational domains with different concurrency models:
 
 ### 1. Hardware Orchestration (The Polling Domain)
-The client acts as the **Master** driver for the SUWOL100 integrated weighing system.
+The client acts as the **Master** driver for the `SUWOL-1000` integrated weighing system.
 
 * **Active Polling & Data Capture**: Since the hardware does not buffer data, the client performs high-frequency polling (sub-100ms) to capture volatile RFID tags and weight data before they vanish.
 * **Feedback Control**: It actively renders visual information on the LED display and triggers voice guidance (TTS) and printer outputs based on the weighing workflow state.
@@ -43,9 +43,9 @@ To satisfy both the strict timing requirements of hardware and the asynchronous 
 * As soon as the Main Loop commits a record to the DB, it pushes a task to this queue.
 * The worker consumes the task and executes the HTTP REST call to the server, ensuring immediate data synchronization.
 
-## 🔌 Hardware Interface (SUWOL100 Protocol)
+## 🔌 Hardware Interface (`SUWOL-1000` Protocol)
 
-The client implements the full **Master-Slave protocol** for SUWOL100:
+The client implements the full **Master-Slave protocol** for `SUWOL-1000`:
 
 * **Communication**: RS-232 Serial (9600bps).
 * **Protocol Logic**:
