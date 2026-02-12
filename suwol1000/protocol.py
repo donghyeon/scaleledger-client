@@ -44,11 +44,15 @@ class PrinterStatus(IntEnum):
 
 
 class RelayCode(IntFlag):
-    OFF = 0x00
-    GREEN = 0x01   # Relay 1: 녹색등 점멸
-    RED = 0x02     # Relay 2: 적색등 점멸
-    FAN = 0x08     # Relay 4: 팬 작동
-    HEATER = 0x10  # Relay 5: 히터 작동
+    OFF    = 0
+    GREEN  = 1 << 0  # Relay 1: 녹색등 점멸
+    RED    = 1 << 1  # Relay 2: 적색등 점멸
+    RELAY3 = 1 << 2  # Relay 3: 모름
+    FAN    = 1 << 3  # Relay 4: 팬 작동
+    HEATER = 1 << 4  # Relay 5: 히터 작동
+    RELAY6 = 1 << 5  # Relay 6: 모름
+    RELAY7 = 1 << 6  # Relay 7: 모름
+    RELAY8 = 1 << 7  # Relay 8: 모름
 
 
 # TODO(donghyeon): Define scale status codes
@@ -74,9 +78,22 @@ class RequestPacket:
 
         reserved1_str = b" " * 6
 
-        relay_value = RelayCode.GREEN * self.green_blink
-        relay_value |= RelayCode.RED * self.red_blink
-        relay_str = f"{relay_value:02X}".encode()
+        relay_value = (
+            RelayCode.GREEN * self.green_blink |
+            RelayCode.RED * self.red_blink |
+            RelayCode.RELAY3 * False |
+            RelayCode.FAN * False |
+            RelayCode.HEATER * False |
+            RelayCode.RELAY6 * False |
+            RelayCode.RELAY7 * False |
+            RelayCode.RELAY8 * False
+        )
+
+        # *주의* hex 표현 아님: 0, 1, ..., 9, A, B, C, D, E, F
+        # ascii 코드 순서 형태: 0, 1, ..., 9, :, ;, <, =, >, ?
+        high_nibble = (relay_value & 0b11110000) >> 4
+        low_nibble  = (relay_value & 0b00001111)
+        relay_str = bytes([high_nibble + ord("0"), low_nibble + ord("0")])
 
         voice_index_str = f"{self.voice_code:02d}".encode()
 
@@ -125,21 +142,37 @@ class ResponsePacket:
             raise ValueError(f"Invalid STX/ETX")
         
         device_id = int(data[1])
+
         command_code = CommandCode(data[2])
+
         rfid_card_uid = data[3:11]
+
         user_command_code = InputCode(data[11])
         user_input = data[12:18]
-        relay_code = RelayCode(int(data[18:20], 16))
+
+        # *주의* hex 표현 아님: 0, 1, ..., 9, A, B, C, D, E, F
+        # ascii 코드 순서 형태: 0, 1, ..., 9, :, ;, <, =, >, ?
+        relay_str = data[18:20]
+        high_nibble = ord(relay_str[0]) - ord("0")
+        low_nibble  = ord(relay_str[1]) - ord("0")
+        relay_value = (high_nibble << 4) | low_nibble
+        relay_code = RelayCode(relay_value)
+
         green_blink = RelayCode.GREEN in relay_code
         red_blink = RelayCode.RED in relay_code
         fan_on = RelayCode.FAN in relay_code
         heater_on = RelayCode.HEATER in relay_code
+        
         unknown_input = data[20:22]
+
         voice_code = VoiceCode(int(data[22:24]))
+
         inner_temperature = int(data[24:27])
         fan_trigger_temp = int(data[27:29])
         heater_trigger_temp = int(data[29:31])
+
         printer_status = PrinterStatus(int(data[31]))
+
         is_weight_stable = data[36:38] == "ST"
         current_weight = int(data[42] + data[43:50].lstrip())
 
