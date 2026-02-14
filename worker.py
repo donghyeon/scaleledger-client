@@ -1,12 +1,16 @@
 # worker.py
-import time
 from enum import Enum, auto
+import time
+from typing import Callable
+
 
 import serial
 import structlog
 from structlog.stdlib import get_logger
 
 from suwol1000.protocol import RequestPacket, ResponsePacket, VoiceCode, ETX
+
+from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 
 
 def setup_logging():
@@ -34,8 +38,14 @@ class WorkerState(Enum):
 
 
 class WeighingStationWorker:
-    def __init__(self, port: str):
+    def __init__(
+        self,
+        port: str,
+        on_event: Callable[[BaseEvent], None] | None = None,
+    ):
         self.port = port
+        self.on_event = on_event
+
         self.state = WorkerState.INITIALIZE
         self.ser: serial.Serial | None = None
         self.logger = get_logger().bind(port=port)
@@ -66,6 +76,10 @@ class WeighingStationWorker:
         else:
             self.logger.debug("hw.serial.already_closed")
     
+    def emit_event(self, event: BaseEvent):
+        if self.on_event:
+            self.on_event(event)
+    
     def idle(self) -> WorkerState:
         request_packet = RequestPacket(display_weight=self.last_weight)
         self.ser.write(request_packet.to_bytes())
@@ -79,10 +93,11 @@ class WeighingStationWorker:
             if response_packet.rfid_card_uid != "00000000":
                 self.last_plate = response_packet.rfid_card_uid
                 self.logger.info(
-                    "hw.card_reader.tagged",
+                    "hw.rfid.detected",
                     rfid_card_uid=response_packet.rfid_card_uid,
                     next_state="MEASURE",
                 )
+                self.emit_event(RFIDTaggedEvent(rfid_card_uid=response_packet.rfid_card_uid))
                 return WorkerState.MEASURE
 
         except ValueError:
@@ -123,6 +138,7 @@ class WeighingStationWorker:
                     break
         
         self.logger.info("hw.weighing.completed", next_state="IDLE")
+        self.emit_event(WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=self.last_weight))
         return WorkerState.IDLE
 
     def recover(self) -> WorkerState:
