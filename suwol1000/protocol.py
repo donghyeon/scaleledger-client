@@ -62,8 +62,8 @@ class RelayCode(IntFlag):
 class RequestPacket:
     device_id: int = 0
     command_code: CommandCode = CommandCode.DISPLAY
-    display_weight: str = "+0000000"
-    display_plate: str = "      "
+    display_weight: int = 0
+    display_plate: str = ""
     green_blink: bool = False
     red_blink: bool = False
     voice_code: VoiceCode = VoiceCode.NONE
@@ -73,8 +73,10 @@ class RequestPacket:
 
         command_code_str = self.command_code.encode()
 
-        display_weight_str = f"{self.display_weight:>8}"[:8].encode()
-        display_plate_str = f"{self.display_plate:>6}"[:6].encode()
+        sign = "+" if self.display_weight >= 0 else "-"
+        abs_weight = str(abs(self.display_weight))
+        display_weight_str=f"{sign}{abs_weight:>7.7}".encode()
+        display_plate_str = f"{self.display_plate:>6.6}".encode()
 
         reserved1_str = b" " * 6
 
