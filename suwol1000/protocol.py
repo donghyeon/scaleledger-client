@@ -76,7 +76,7 @@ class RequestPacket:
         sign = "+" if self.display_weight >= 0 else "-"
         abs_weight = str(abs(self.display_weight))
         display_weight_str=f"{sign}{abs_weight:>7.7}".encode()
-        display_plate_str = f"{self.display_plate:>6.6}".encode()
+        display_plate_str = f"{self.display_plate[-6:]:>6}".encode()
 
         reserved1_str = b" " * 6
 
