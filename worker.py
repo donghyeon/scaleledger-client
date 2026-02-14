@@ -6,7 +6,7 @@ import serial
 import structlog
 from structlog.stdlib import get_logger
 
-from suwol1000.protocol import RequestPacket, ResponsePacket, ETX
+from suwol1000.protocol import RequestPacket, ResponsePacket, VoiceCode, ETX
 
 
 def setup_logging():
@@ -28,7 +28,8 @@ def setup_logging():
 class WorkerState(Enum):
     INITIALIZE = auto()
     CONNECT = auto()
-    STANDBY = auto()
+    IDLE = auto()
+    MEASURE = auto()
     RECOVER = auto()
 
 
@@ -44,6 +45,8 @@ class WeighingStationWorker:
 
         self.polling_interval = 0.1
         self.retry_interval = 10
+
+        self.is_speaker_on = False
     
     def initialize(self) -> WorkerState:
         self.logger.info("sys.worker.startup", next_state="CONNECT")
@@ -53,8 +56,8 @@ class WeighingStationWorker:
         self.logger.debug("hw.serial.connecting")
         self.ser = serial.Serial(self.port, timeout=1.0)
         self.ser.reset_input_buffer()
-        self.logger.info("hw.serial.connected", next_state="STANDBY")
-        return WorkerState.STANDBY
+        self.logger.info("hw.serial.connected", next_state="IDLE")
+        return WorkerState.IDLE
 
     def close(self):
         if self.ser and self.ser.is_open:
@@ -63,25 +66,65 @@ class WeighingStationWorker:
         else:
             self.logger.debug("hw.serial.already_closed")
     
-    def standby(self) -> WorkerState:
-        request_packet = RequestPacket(
-            display_weight=self.last_weight,
-            display_plate=self.last_plate,
-        )
+    def idle(self) -> WorkerState:
+        request_packet = RequestPacket(display_weight=self.last_weight)
         self.ser.write(request_packet.to_bytes())
 
         response = self.ser.read_until(expected=ETX)
         try:
             response_packet = ResponsePacket.from_bytes(response)
             if response_packet.current_weight != self.last_weight:
-                self.logger.info("hw.scale.weight_changed", packet=response_packet)
                 self.last_weight = response_packet.current_weight
+            
+            if response_packet.rfid_card_uid != "00000000":
+                self.last_plate = response_packet.rfid_card_uid
+                self.logger.info(
+                    "hw.card_reader.tagged",
+                    rfid_card_uid=response_packet.rfid_card_uid,
+                    next_state="MEASURE",
+                )
+                return WorkerState.MEASURE
+
         except ValueError:
             self.logger.exception("hw.protocol.parse_error", response=response)
         
         time.sleep(self.polling_interval)
-        return WorkerState.STANDBY
+        return WorkerState.IDLE
     
+    def measure(self) -> WorkerState:
+        voice_codes = [
+            VoiceCode.PLEASE_WAIT,
+            VoiceCode.WEIGHT_COMPLETE,
+            VoiceCode.THANK_YOU,
+        ]
+        
+        is_speaker_on = False
+        for voice_code in voice_codes:
+            self.logger.info("hw.speaker.on", voice=voice_code.name)
+            while True:
+                request_packet = RequestPacket(
+                    display_weight=self.last_weight,
+                    display_plate=self.last_plate,
+                    green_blink=True,
+                    voice_code=VoiceCode.NONE if is_speaker_on else voice_code,
+                )
+                self.ser.write(request_packet.to_bytes())
+
+                response = self.ser.read_until(expected=ETX)
+                try:
+                    response_packet = ResponsePacket.from_bytes(response)
+                    if response_packet.current_weight != self.last_weight:
+                        self.last_weight = response_packet.current_weight
+                    is_speaker_on = response_packet.voice_code != VoiceCode.NONE
+                except ValueError:
+                    self.logger.exception("hw.protocol.parse_error", response=response)
+                time.sleep(self.polling_interval)
+                if not is_speaker_on:
+                    break
+        
+        self.logger.info("hw.weighing.completed", next_state="IDLE")
+        return WorkerState.IDLE
+
     def recover(self) -> WorkerState:
         self.close()
         self.logger.info("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")
@@ -97,8 +140,10 @@ class WeighingStationWorker:
                         self.state = self.initialize()
                     case WorkerState.CONNECT:
                         self.state = self.connect()
-                    case WorkerState.STANDBY:
-                        self.state = self.standby()
+                    case WorkerState.IDLE:
+                        self.state = self.idle()
+                    case WorkerState.MEASURE:
+                        self.state = self.measure()
                     case WorkerState.RECOVER:
                         self.state = self.recover()
             except serial.SerialTimeoutException:
