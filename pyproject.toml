@@ -11,4 +11,5 @@ dependencies = [
     "structlog>=25.5.0",
     "tortoise-orm>=0.25.4",
     "tzdata>=2025.3",
+    "websockets>=16.0",
 ]
