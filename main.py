@@ -35,7 +35,7 @@ class HeadlessClient:
 
         self.api_client = APIClient(base_url=self.base_url)
         self.ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
-        self.provisioning_url = f"{self.ws_url}/ws/devices/gateways/provisioning/candidate/"
+        self.provisioning_url = f"{self.ws_url}/ws/devices/gateways/provisioning/"
 
         self.mac_address = get_mac_address()
         self.ip_address = get_ip_address()

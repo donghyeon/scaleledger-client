@@ -1,7 +1,7 @@
 # 🐟 ScaleLedger Client Product Requirements Document (PRD)
 
-**문서 버전**: 2.1
-**작성 일자**: 2026.02.11
+**문서 버전**: 3.0
+**작성 일자**: 2026.02.19
 **대상 독자**: 엣지 클라이언트 개발자, 임베디드 시스템 엔지니어
 
 ---
@@ -12,9 +12,9 @@
 **ScaleLedger Client**는 수산물 경매 현장의 게이트웨이 PC에서 실행되는 **Headless IoT Edge Controller**입니다. 중앙 서버(Django)의 정책을 수신하여 로컬 장비를 제어하고, 물리적 계량 장비(`SUWOL-1000`)와 고속 통신을 수행하여 계량 데이터를 확보하는 핵심 미들웨어입니다.
 
 ### 1.2 핵심 철학 (Core Philosophy)
-1.  **Event-Driven & Reactive (이벤트 기반 반응형)**: 하드웨어 폴링을 제외한 모든 로직(데이터 동기화, 서버 통신)은 이벤트 기반으로 동작하여 불필요한 리소스 소모를 제거합니다.
+1.  **On-Demand Provisioning (이벤트 기반 등록)**: 게이트웨이 등록 및 하드웨어 스캔 과정에서 불필요한 Polling API 호출을 완전히 제거했습니다. 클라이언트는 WebSocket을 통해 서버의 명령(Command)을 대기하며, 관리자의 실시간 스캔 요청에만 응답합니다.
 2.  **Local-First & Sync (선 저장 후 전송)**: 모든 계량 데이터는 로컬 DB(SQLite)에 우선 저장되어야 하며, 네트워크 상태와 무관하게 현장 업무는 지속되어야 합니다.
-3.  **PC-Driven Control (PC 주도 제어)**: 연결된 계량 장비(`SUWOL-1000`)는 수동적인 Slave 장치입니다. 클라이언트는 전광판 표시, 음성 안내, 프린터 출력을 능동적으로 제어해야 합니다.
+3.  **PC-Driven Control (PC 주도 제어)**: 연결된 계량 장비(`SUWOL-1000`)는 수동적인 Slave 장치입니다. 클라이언트는 Hardware Worker Thread를 통해 장비를 고속 폴링(Polling)하며 제어권을 독점합니다.
 
 ---
 
@@ -55,19 +55,26 @@
 
 ## 4. 상세 기능 명세 (Detailed Specifications)
 
-### 4.1 상태 관리 (Finite State Machine)
-1.  **INITIALIZE**: 부팅 직후 로컬 DB 점검.
-2.  **SYNC**: 서버 등록 상태 확인 및 토큰 갱신.
-3.  **REGISTER**: 신규 기기 등록 프로세스.
-4.  **HEARTBEAT**: 정상 운영 상태. (30초 주기 생존 신고)
+### 4.1 접속 및 프로비저닝 상태 관리 (Network Event Loop)
+기존의 복잡한 등록 확인 무한 폴링(FSM) 로직을 폐기하고, 단순화된 **WebSocket 기반 이벤트 대기** 로직을 사용합니다.
 
-### 4.2 계량 및 저장 프로세스 (Weighing Logic)
-1.  **측정 완료 (Completed)**:
-    * RFID 인식 및 중량 안정화 조건 만족 시 발생.
-2.  **로컬 저장 (Persistence)**:
-    * `WeighingRecord`를 SQLite에 저장 (`is_synced=False`).
-3.  **큐 주입 (Enqueue)**:
-    * 저장된 레코드 객체를 즉시 `asyncio.Queue`에 `put_nowait()`으로 주입.
+1.  **BOOTSTRAP (부팅 및 점검)**
+    * 로컬 DB(`SQLite`)를 조회하여 할당된 `access_token`이 있는지 확인합니다.
+    * 없으면 서버의 `/devices/api/gateways/{mac_address}/` API를 호출하여 등록 여부를 확인합니다.
+2.  **PROVISIONING LISTENER (대기 상태)**
+    * 서버에 미등록 상태(404)인 경우, 클라이언트는 즉시 `/ws/devices/gateways/provisioning/` 웹소켓에 연결합니다.
+    * 서버(관리자 웹)로부터 `identify` 이벤트가 수신되면, 현재 기기의 `mac_address`, `hostname`, `ip_address`를 취합하여 즉시 응답 패킷을 발송합니다.
+3.  **ACTIVE (정상 운영 및 명령 대기)**
+    * 등록이 완료된 상태에서는 정해진 주기에 따라 HTTP 로 Heartbeat를 전송합니다.
+    * 개별 기기 전용 웹소켓(`/ws/devices/{gateway_id}/`)에 연결하여 원격 명령을 수신합니다.
+
+### 4.2 주변기기 동적 스캔 (Peripheral Scan via WebSocket)
+관리자가 웹 대시보드에서 현장 PC에 연결된 시리얼 장비 목록을 원격으로 스캔할 수 있도록 지원해야 합니다.
+
+* **Trigger**: 서버로부터 웹소켓을 통해 `command.scan.peripherals` 이벤트 수신.
+* **Action**: `serial.tools.list_ports.comports()`를 실행하여 현재 꽂혀있는 모든 시리얼 장치 정보(포트명, 하드웨어 ID, 제조사 등)를 수집합니다.
+* **Response**: 수집된 JSON 배열을 웹소켓 채널을 통해 서버로 반환하여, 관리자가 웹 UI상에서 올바른 `WeighingStation`을 직관적으로 선택할 수 있도록 합니다.
+
 
 ### 4.3 데이터 동기화 (Event-Driven Sync Strategy)
 **Polling을 금지하며**, 큐(Queue)를 이용한 즉시 전송 방식을 사용합니다.
