@@ -11,14 +11,15 @@ class APIClient:
 
     async def close(self):
         await self.client.aclose()
-
-    async def retrieve_gateway(self, mac_address: str) -> Dict[str, Any]:
-        response = await self.client.get(f"devices/api/gateways/{mac_address}/")
+    
+    async def retrieve_gateway_self(self, access_token: str) -> Dict[str, Any]:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        response = await self.client.get("devices/api/gateways/self/", headers=headers)
         response.raise_for_status()
         return response.json()
 
     async def send_heartbeat(self, access_token: str) -> Dict[str, Any]:
-        headers = {"Authorization": f"Bearer {access_token}"}
+        headers = {"Authorization": f"Gateway {access_token}"}
         response = await self.client.post("devices/api/gateways/heartbeat/", headers=headers)
         response.raise_for_status()
         return response.json()
