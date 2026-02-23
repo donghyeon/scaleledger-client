@@ -1,5 +1,5 @@
 # api.py
-from typing import Dict, Any
+from typing import Any, Dict, List
 
 import httpx
 
@@ -11,10 +11,16 @@ class APIClient:
 
     async def close(self):
         await self.client.aclose()
-    
+
     async def retrieve_gateway_self(self, access_token: str) -> Dict[str, Any]:
         headers = {"Authorization": f"Gateway {access_token}"}
         response = await self.client.get("devices/api/gateways/self/", headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def list_gateway_stations(self, access_token: str) -> List[Dict[str, Any]]:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        response = await self.client.get("devices/api/gateways/self/stations/", headers=headers)
         response.raise_for_status()
         return response.json()
 

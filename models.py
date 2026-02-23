@@ -19,4 +19,22 @@ class Gateway(Model):
         table = "gateway"
 
     def __repr__(self):
-        return f"<Gateway(id={self.id}, name={self.name})>"
+        return f"<Gateway(hostname={self.hostname}, name={self.name})>"
+
+
+class WeighingStation(Model):
+    id = fields.IntField(pk=True)
+    gateway = fields.ForeignKeyField("models.Gateway", related_name="weighing_stations")
+    name = fields.CharField(max_length=100)
+    description = fields.TextField()
+    serial_port = fields.CharField(max_length=100)
+    serial_description = fields.CharField(max_length=100)
+    serial_location = fields.CharField(max_length=100)
+    serial_number = fields.CharField(max_length=100)
+    serial_manufacturer = fields.CharField(max_length=100)
+
+    class Meta:
+        table = "weighing_station"
+
+    def __repr__(self):
+        return f"<WeighingStation(port={self.serial_port}, name={self.name})>"

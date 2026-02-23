@@ -9,7 +9,7 @@ from tortoise import Tortoise
 import websockets
 
 from api import APIClient
-from models import Gateway
+from models import Gateway, WeighingStation
 from utils import get_mac_address, get_ip_address, get_hostname, scan_peripherals
 
 
@@ -87,20 +87,20 @@ class HeadlessClient:
         
         self.logger.info("sys.boot.remote_api.syncing")
         try:
-            gateway_data = await self.api_client.retrieve_gateway_self(self.access_token)
+            retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
 
             gateway, _ = await Gateway.update_or_create(
                 mac_address=self.mac_address,
                 defaults={
-                    "id": gateway_data["id"],
-                    "hostname": gateway_data["hostname"],
-                    "ip_address": gateway_data["ip_address"],
-                    "name": gateway_data["name"],
-                    "description": gateway_data["description"],
-                    "access_token": gateway_data["access_token"],
-                    "last_heartbeat": gateway_data["last_heartbeat"],
-                    "created_at": gateway_data["created_at"],
-                    "updated_at": gateway_data["updated_at"],
+                    "id": retrieved_gateway["id"],
+                    "hostname": retrieved_gateway["hostname"],
+                    "ip_address": retrieved_gateway["ip_address"],
+                    "name": retrieved_gateway["name"],
+                    "description": retrieved_gateway["description"],
+                    "access_token": retrieved_gateway["access_token"],
+                    "last_heartbeat": retrieved_gateway["last_heartbeat"],
+                    "created_at": retrieved_gateway["created_at"],
+                    "updated_at": retrieved_gateway["updated_at"],
                 }
             )
             self.gateway_id = gateway.id
@@ -114,6 +114,46 @@ class HeadlessClient:
                 self.logger.exception("sys.boot.remote_api.error", status=e.response.status_code)
         except httpx.RequestError:
             self.logger.warning("sys.boot.network.offline", action="fallback_to_local_cache")
+    
+    async def sync_weighing_stations(self):
+        self.logger.info("sys.sync.weighing_stations.started")
+        try:
+            retrieved_stations = await self.api_client.list_gateway_stations(self.access_token)
+
+            station_ids = []
+            for station in retrieved_stations:
+                station_ids.append(station["id"])
+                await WeighingStation.update_or_create(
+                    id=station["id"],
+                    defaults={
+                        "gateway_id": station["gateway"],
+                        "name": station["name"],
+                        "description": station["description"],
+                        "serial_port": station["serial_port"],
+                        "serial_description": station["serial_description"],
+                        "serial_location": station["serial_location"],
+                        "serial_number": station["serial_number"],
+                        "serial_manufacturer": station["serial_manufacturer"],
+                    },
+                )
+
+            deleted_count = await WeighingStation.filter(id__not_in=station_ids).delete()
+            
+            self.logger.info(
+                "sys.sync.weighing_stations.completed",
+                synced_count=len(retrieved_stations),
+                deleted_count=deleted_count,
+            )
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403, 404):
+                self.logger.error("net.api.sync_stations.auth_rejected", status=e.response.status_code)
+                raise AuthDegradedError("Sync stations auth failed")
+            self.logger.error("net.api.sync_stations.server_error", status=e.response.status_code)
+        except httpx.RequestError:
+            self.logger.warning("net.api.sync_stations.network_error")
+        except Exception:
+            self.logger.exception("sys.sync.weighing_stations.fatal_error")
 
     async def run(self):
         setup_logging()
@@ -202,8 +242,14 @@ class HeadlessClient:
                             "payload": peripherals,
                         }))
                         self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
+
+                    case "sync.weighing_stations":
+                        self.logger.info("biz.active.sync_stations.executing")
+                        await self.sync_weighing_stations()
+
                     case _:
                         self.logger.debug("net.ws.message.ignored", type=message_type)
+
             except json.JSONDecodeError:
                 self.logger.error("net.ws.message.invalid_json")
 
