@@ -9,9 +9,11 @@ from tortoise import Tortoise
 import websockets
 
 from api import APIClient, AuthDegradedError
-from models import Gateway, WeighingStation, Record
-from utils import get_mac_address, get_ip_address, get_hostname, scan_peripherals
-from workers import RecordUploadWorker, HeartbeatWorker
+from events import BaseEvent, WeighingCompletedEvent
+from managers import WeighingStationManager
+from models import Gateway, Record, WeighingStation
+from utils import get_hostname, get_ip_address, get_mac_address, scan_peripherals
+from workers import HeartbeatWorker, RecordUploadWorker
 
 
 def setup_logging():
@@ -50,8 +52,39 @@ class HeadlessClient:
         self.gateway_id: int | None = None
 
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.station_manager = WeighingStationManager(on_event=self.handle_hardware_event)
+        self.main_loop = None
+
+    def handle_hardware_event(self, event: BaseEvent):
+        self.main_loop.call_soon_threadsafe(asyncio.create_task, self.process_hardware_event(event))
+
+    async def process_hardware_event(self, event: BaseEvent):
+        try:
+            if isinstance(event, WeighingCompletedEvent):
+                self.logger.info(
+                    "biz.weighing.completed", 
+                    event_id=event.uuid,
+                    rfid=event.rfid_card_uid, 
+                    weight=event.weight
+                )
+
+                record = await Record.create(
+                    uuid=event.uuid,
+                    rfid_card_uid=event.rfid_card_uid,
+                    weight=event.weight,
+                    measured_at=event.timestamp,
+                )
+
+                self.logger.info("biz.record.created", uuid=str(record.uuid), weight=event.weight)
+
+                await self.upload_queue.put(str(event.uuid))
+
+                self.logger.debug("biz.record.queued_for_upload", queue_size=self.upload_queue.qsize())
+        except Exception:
+            self.logger.exception("biz.record.local_save_failed", event_id=event.uuid)
 
     async def close(self):
+        self.station_manager.stop_all()
         await self.api_client.close()
         await Tortoise.close_connections()
         self.logger.info("sys.lifecycle.process.shutdown")
@@ -138,6 +171,9 @@ class HeadlessClient:
 
             deleted_count = await WeighingStation.filter(id__not_in=station_ids).delete()
             
+            current_stations = await WeighingStation.all()
+            self.station_manager.sync(current_stations)
+
             self.logger.info(
                 "sys.sync.weighing_stations.completed",
                 synced_count=len(retrieved_stations),
@@ -156,6 +192,8 @@ class HeadlessClient:
 
     async def run(self):
         setup_logging()
+
+        self.main_loop = asyncio.get_running_loop()
         await self.setup()
 
         is_running = True
@@ -224,30 +262,35 @@ class HeadlessClient:
         target_ws_url = f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/"
         self.logger.info("net.ws.active.connecting", url=target_ws_url)
 
-        unsynced_records = await Record.all().values_list("uuid", flat=True)
-        for record_uuid in unsynced_records:
-            self.upload_queue.put_nowait(str(record_uuid))
-        
-        if unsynced_records:
-            self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
-
-        async with websockets.connect(target_ws_url) as ws:
-            self.logger.info("net.ws.active.connected")
-
-            heartbeat_worker = HeartbeatWorker(
-                api_client=self.api_client,
-                access_token=self.access_token,
-            )
-            upload_worker = RecordUploadWorker(
-                api_client=self.api_client,
-                upload_queue=self.upload_queue,
-                access_token=self.access_token,
-            )
+        try:
+            unsynced_records = await Record.all().values_list("uuid", flat=True)
+            for record_uuid in unsynced_records:
+                self.upload_queue.put_nowait(str(record_uuid))
             
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self.listen_active_ws(ws))
-                tg.create_task(heartbeat_worker.run())
-                tg.create_task(upload_worker.run())
+            if unsynced_records:
+                self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
+            
+            await self.sync_weighing_stations()
+
+            async with websockets.connect(target_ws_url) as ws:
+                self.logger.info("net.ws.active.connected")
+
+                heartbeat_worker = HeartbeatWorker(
+                    api_client=self.api_client,
+                    access_token=self.access_token,
+                )
+                upload_worker = RecordUploadWorker(
+                    api_client=self.api_client,
+                    upload_queue=self.upload_queue,
+                    access_token=self.access_token,
+                )
+                
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.listen_active_ws(ws))
+                    tg.create_task(heartbeat_worker.run())
+                    tg.create_task(upload_worker.run())
+        finally:
+            self.station_manager.stop_all()
     
     async def listen_active_ws(self, ws):
         async for message in ws:
