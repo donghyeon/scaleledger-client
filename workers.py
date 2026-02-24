@@ -3,7 +3,7 @@ import asyncio
 import httpx
 from structlog.stdlib import get_logger
 
-from api import APIClient, AuthDegradedError
+from api import APIClient, AuthDegradedError, RecordCreateDTO
 from models import Record
 
 
@@ -28,20 +28,18 @@ class RecordUploadWorker:
                     self.logger.debug("biz.record.already_purged_or_missing", uuid=record_uuid)
                     continue
 
-                response = await self.api_client.create_record(
+                await self.api_client.create_record(
                     access_token=self.access_token,
-                    uuid=str(record.uuid),
-                    rfid_card_uid=record.rfid_card_uid,
-                    weight=record.weight,
-                    measured_at=record.measured_at.isoformat(),
+                    record=RecordCreateDTO(
+                        uuid=record.uuid,
+                        rfid_card_uid=record.rfid_card_uid,
+                        weight=record.weight,
+                        measured_at=record.measured_at,
+                    ),
                 )
 
-                if response.status_code in (200, 201):
-                    await record.delete()
-                    self.logger.info("biz.record.upload_success_and_purged", uuid=record_uuid)
-                else:
-                    self.logger.error("net.api.record_upload.unexpected_status", status=response.status_code)
-                    await self._requeue(record_uuid)
+                await record.delete()
+                self.logger.info("biz.record.upload_success_and_purged", uuid=record_uuid)
 
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code

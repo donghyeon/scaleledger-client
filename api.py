@@ -1,9 +1,18 @@
 # api.py
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List
+import uuid
 
 import httpx
 
-from models import Record
+
+@dataclass
+class RecordCreateDTO:
+    uuid: uuid.UUID
+    rfid_card_uid: str
+    weight: int
+    measured_at: datetime
 
 
 class AuthDegradedError(Exception):
@@ -36,7 +45,7 @@ class APIClient:
         response.raise_for_status()
         return response.json()
 
-    async def create_record(self, access_token: str, record: Record) -> dict:
+    async def create_record(self, access_token: str, record: RecordCreateDTO) -> dict:
         headers = {"Authorization": f"Gateway {access_token}"}
         payload = {
             "uuid": str(record.uuid),
