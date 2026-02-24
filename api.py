@@ -3,6 +3,12 @@ from typing import Any, Dict, List
 
 import httpx
 
+from models import Record
+
+
+class AuthDegradedError(Exception):
+    pass
+
 
 class APIClient:
     def __init__(self, base_url: str):
@@ -27,5 +33,17 @@ class APIClient:
     async def send_heartbeat(self, access_token: str) -> Dict[str, Any]:
         headers = {"Authorization": f"Gateway {access_token}"}
         response = await self.client.post("devices/api/gateways/heartbeat/", headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def create_record(self, access_token: str, record: Record) -> dict:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        payload = {
+            "uuid": str(record.uuid),
+            "rfid_card_uid": record.rfid_card_uid,
+            "weight": record.weight,
+            "measured_at": record.measured_at.isoformat(),
+        }
+        response = await self.client.post("weighing/api/records/", json=payload, headers=headers)
         response.raise_for_status()
         return response.json()

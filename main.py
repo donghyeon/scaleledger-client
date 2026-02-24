@@ -8,9 +8,10 @@ from structlog.stdlib import get_logger
 from tortoise import Tortoise
 import websockets
 
-from api import APIClient
-from models import Gateway, WeighingStation
+from api import APIClient, AuthDegradedError
+from models import Gateway, WeighingStation, Record
 from utils import get_mac_address, get_ip_address, get_hostname, scan_peripherals
+from workers import RecordUploadWorker, HeartbeatWorker
 
 
 def setup_logging():
@@ -27,10 +28,6 @@ def setup_logging():
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
-
-
-class AuthDegradedError(Exception):
-    pass
 
 
 class HeadlessClient:
@@ -51,6 +48,8 @@ class HeadlessClient:
 
         self.access_token: str | None = None
         self.gateway_id: int | None = None
+
+        self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def close(self):
         await self.api_client.close()
@@ -107,9 +106,9 @@ class HeadlessClient:
             self.logger.info("sys.boot.remote_api.success", gateway_id=self.gateway_id)
             
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (401, 403, 404):
+            if e.response.status_code in (401, 403):
                 self.logger.warning("sys.boot.auth.rejected", status=e.response.status_code)
-                await self.wipe_local_auth()
+                raise AuthDegradedError("Bootstrap auth failed")
             else:
                 self.logger.exception("sys.boot.remote_api.error", status=e.response.status_code)
         except httpx.RequestError:
@@ -146,7 +145,7 @@ class HeadlessClient:
             )
 
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (401, 403, 404):
+            if e.response.status_code in (401, 403):
                 self.logger.error("net.api.sync_stations.auth_rejected", status=e.response.status_code)
                 raise AuthDegradedError("Sync stations auth failed")
             self.logger.error("net.api.sync_stations.server_error", status=e.response.status_code)
@@ -159,24 +158,29 @@ class HeadlessClient:
         setup_logging()
         await self.setup()
 
-        while True:
-            await self.bootstrap()
-
+        is_running = True
+        while is_running:
             try:
+                await self.bootstrap()
+
                 if not self.access_token:
                     await self.run_provisioning_loop()
                 else:
                     await self.run_active_loop()
-            except AuthDegradedError:
-                self.logger.exception("sys.loop.auth_degraded", action="wipe_and_retry")
+
+            except* AuthDegradedError:
+                self.logger.warning("sys.loop.auth_degraded", action="wipe_and_retry")
                 await self.wipe_local_auth()
-            except (websockets.exceptions.ConnectionClosed, OSError):
+
+            except* (websockets.exceptions.ConnectionClosed, OSError):
                 self.logger.exception("net.ws.connection_lost", retry_in=self.retry_interval)
                 await asyncio.sleep(self.retry_interval)
-            except asyncio.CancelledError:
+
+            except* asyncio.CancelledError:
                 self.logger.info("sys.loop.cancelled")
-                break
-            except Exception:
+                is_running = False
+
+            except* Exception:
                 self.logger.exception("sys.loop.unexpected_crashed", retry_in=self.retry_interval)
                 await asyncio.sleep(self.retry_interval)
     
@@ -220,12 +224,30 @@ class HeadlessClient:
         target_ws_url = f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/"
         self.logger.info("net.ws.active.connecting", url=target_ws_url)
 
+        unsynced_records = await Record.all().values_list("uuid", flat=True)
+        for record_uuid in unsynced_records:
+            self.upload_queue.put_nowait(str(record_uuid))
+        
+        if unsynced_records:
+            self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
+
         async with websockets.connect(target_ws_url) as ws:
             self.logger.info("net.ws.active.connected")
+
+            heartbeat_worker = HeartbeatWorker(
+                api_client=self.api_client,
+                access_token=self.access_token,
+            )
+            upload_worker = RecordUploadWorker(
+                api_client=self.api_client,
+                upload_queue=self.upload_queue,
+                access_token=self.access_token,
+            )
             
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self.listen_active_ws(ws))
-                tg.create_task(self.heartbeat_worker())
+                tg.create_task(heartbeat_worker.run())
+                tg.create_task(upload_worker.run())
     
     async def listen_active_ws(self, ws):
         async for message in ws:
@@ -252,22 +274,6 @@ class HeadlessClient:
 
             except json.JSONDecodeError:
                 self.logger.error("net.ws.message.invalid_json")
-
-    async def heartbeat_worker(self):
-        while True:
-            try:
-                self.logger.debug("net.api.heartbeat.sending")
-                await self.api_client.send_heartbeat(self.access_token)
-                self.logger.debug("net.api.heartbeat.success")
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (401, 403, 404):
-                    self.logger.error("net.api.heartbeat.auth_rejected", status=e.response.status_code)
-                    raise AuthDegradedError("Heartbeat auth failed")
-                self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
-            except httpx.RequestError:
-                self.logger.warning("net.api.heartbeat.network_error")
-            
-            await asyncio.sleep(30)
 
 
 async def main():

@@ -38,3 +38,16 @@ class WeighingStation(Model):
 
     def __repr__(self):
         return f"<WeighingStation(port={self.serial_port}, name={self.name})>"
+
+
+class Record(Model):
+    uuid = fields.UUIDField(pk=True)
+    rfid_card_uid = fields.CharField(max_length=20)
+    weight = fields.IntField()
+    measured_at = fields.DatetimeField()
+
+    class Meta:
+        table = "record"
+    
+    def __repr__(self):
+        return f"<Record(rfid_card_uid={self.rfid_card_uid}, weight={self.weight}, measured_at={self.measured_at})>"

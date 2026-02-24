@@ -121,7 +121,7 @@
 | `serial_number` | TEXT | 하드웨어 시리얼 (옵션) |
 | `updated_at` | DATETIME | 서버 갱신 시각 (동기화 기준값) |
 
-### 5.3 WeighingRecord (계량 기록 원본 - [TODO: 구현 예정])
+### 5.3 Record (계량 기록 원본)
 현장에서 발생한 물리적 계량 사실의 **원천 데이터(Source of Truth)**입니다. 클라이언트는 이 데이터를 무조건 로컬 DB에 우선 저장한 후, 백그라운드에서 서버로 동기화(업로드)하는 책임을 가집니다. (현재 미구현 상태)
 
 | Field | Type | Description |
@@ -130,8 +130,6 @@
 | `rfid_uid` | TEXT | 태그된 RFID 값 |
 | `weight` | INT | 측정 중량 (kg) |
 | `measured_at` | DATETIME | 측정 완료 시각 |
-| `is_synced` | BOOLEAN | 서버 전송 여부 (Index) |
-| `created_at` | DATETIME | 로컬 생성 시각 |
 
 ---
 
