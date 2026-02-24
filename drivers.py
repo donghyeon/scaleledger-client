@@ -1,6 +1,6 @@
 # drivers.py
+import threading
 from enum import Enum, auto
-import time
 from typing import Callable
 
 
@@ -41,6 +41,7 @@ class WeighingStationDriver:
     def __init__(
         self,
         port: str,
+        stop_event: threading.Event | None = None,
         on_event: Callable[[BaseEvent], None] | None = None,
     ):
         self.port = port
@@ -50,13 +51,36 @@ class WeighingStationDriver:
         self.ser: serial.Serial | None = None
         self.logger = get_logger().bind(port=port)
 
+        self.stop_event = stop_event or threading.Event()
+
         self.last_weight = 0
         self.last_plate = ""
 
         self.polling_interval = 0.1
-        self.retry_interval = 10
+        self.retry_interval = 10.0
+    
+    def stop(self):
+        self.logger.info("sys.worker.stop_requested")
+        self.stop_event.set()
 
-        self.is_speaker_on = False
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.cancel_read()
+                self.ser.cancel_write()
+            except Exception:
+                self.logger.exception("hw.serial.cancel_failed")
+    
+    def cleanup(self):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+                self.logger.info("hw.serial.closed")
+            except Exception:
+                self.logger.exception("hw.serial.close_failed")
+    
+    def emit_event(self, event: BaseEvent):
+        if self.on_event:
+            self.on_event(event)
     
     def initialize(self) -> DriverState:
         self.logger.info("sys.worker.startup", next_state="CONNECT")
@@ -68,42 +92,37 @@ class WeighingStationDriver:
         self.ser.reset_input_buffer()
         self.logger.info("hw.serial.connected", next_state="IDLE")
         return DriverState.IDLE
-
-    def close(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            self.logger.info("hw.serial.closed")
-        else:
-            self.logger.debug("hw.serial.already_closed")
-    
-    def emit_event(self, event: BaseEvent):
-        if self.on_event:
-            self.on_event(event)
     
     def idle(self) -> DriverState:
         request_packet = RequestPacket(display_weight=self.last_weight)
         self.ser.write(request_packet.to_bytes())
 
         response = self.ser.read_until(expected=ETX)
-        try:
-            response_packet = ResponsePacket.from_bytes(response)
-            if response_packet.current_weight != self.last_weight:
-                self.last_weight = response_packet.current_weight
-            
-            if response_packet.rfid_card_uid != "00000000":
-                self.last_plate = response_packet.rfid_card_uid
-                self.logger.info(
-                    "hw.rfid.detected",
-                    rfid_card_uid=response_packet.rfid_card_uid,
-                    next_state="MEASURE",
-                )
-                self.emit_event(RFIDTaggedEvent(rfid_card_uid=response_packet.rfid_card_uid))
-                return DriverState.MEASURE
 
-        except ValueError:
-            self.logger.exception("hw.protocol.parse_error", response=response)
+        if self.stop_event.is_set():
+            self.logger.debug("hw.serial.read_cancelled_by_interrupt")
+            return DriverState.IDLE
         
-        time.sleep(self.polling_interval)
+        if not response or not response.endswith(ETX):
+            self.logger.warning("hw.serial.read_timeout_or_incomplete", response=response)
+            return DriverState.RECOVER
+
+        response_packet = ResponsePacket.from_bytes(response)
+
+        if response_packet.current_weight != self.last_weight:
+            self.last_weight = response_packet.current_weight
+        
+        if response_packet.rfid_card_uid != "00000000":
+            self.last_plate = response_packet.rfid_card_uid
+            self.logger.info(
+                "hw.rfid.detected",
+                rfid_card_uid=response_packet.rfid_card_uid,
+                next_state="MEASURE",
+            )
+            self.emit_event(RFIDTaggedEvent(rfid_card_uid=response_packet.rfid_card_uid))
+            return DriverState.MEASURE
+        
+        self.stop_event.wait(self.polling_interval)
         return DriverState.IDLE
     
     def measure(self) -> DriverState:
@@ -115,25 +134,34 @@ class WeighingStationDriver:
         
         is_speaker_on = False
         for voice_code in voice_codes:
+            if self.stop_event.is_set():
+                return DriverState.IDLE
+            
             self.logger.info("hw.speaker.on", voice=voice_code.name)
-            while True:
+            while not self.stop_event.is_set():
                 request_packet = RequestPacket(
                     display_weight=self.last_weight,
                     display_plate=self.last_plate,
                     green_blink=True,
                     voice_code=VoiceCode.NONE if is_speaker_on else voice_code,
                 )
-                self.ser.write(request_packet.to_bytes())
 
+                self.ser.write(request_packet.to_bytes())
                 response = self.ser.read_until(expected=ETX)
-                try:
-                    response_packet = ResponsePacket.from_bytes(response)
-                    if response_packet.current_weight != self.last_weight:
-                        self.last_weight = response_packet.current_weight
-                    is_speaker_on = response_packet.voice_code != VoiceCode.NONE
-                except ValueError:
-                    self.logger.exception("hw.protocol.parse_error", response=response)
-                time.sleep(self.polling_interval)
+
+                if self.stop_event.is_set():
+                    return DriverState.IDLE
+                
+                if not response or not response.endswith(ETX):
+                    self.logger.warning("hw.serial.read_timeout_or_incomplete", response=response)
+                    return DriverState.RECOVER
+                
+                response_packet = ResponsePacket.from_bytes(response)
+                if response_packet.current_weight != self.last_weight:
+                    self.last_weight = response_packet.current_weight
+                is_speaker_on = response_packet.voice_code != VoiceCode.NONE
+
+                self.stop_event.wait(self.polling_interval)
                 if not is_speaker_on:
                     break
         
@@ -142,13 +170,17 @@ class WeighingStationDriver:
         return DriverState.IDLE
 
     def recover(self) -> DriverState:
-        self.close()
         self.logger.info("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")
-        time.sleep(self.retry_interval)
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        
+        self.stop_event.wait(self.retry_interval)
         return DriverState.CONNECT
 
     def run(self):
-        while True:
+        self.logger.info("sys.worker.started")
+
+        while not self.stop_event.is_set():
             structlog.contextvars.bind_contextvars(state=self.state.name)
             try:
                 match self.state:
@@ -164,9 +196,23 @@ class WeighingStationDriver:
                         self.state = self.recover()
             except serial.SerialTimeoutException:
                 self.logger.exception("hw.serial.timeout")
+                self.state = DriverState.RECOVER
+
             except serial.SerialException:
                 self.logger.exception("hw.serial.connection_lost")
                 self.state = DriverState.RECOVER
+            
+            except ValueError:
+                self.logger.exception("hw.protocol.parse_error")
+                self.state = DriverState.IDLE
+            
+            except Exception:
+                self.logger.exception("sys.worker.unexpected_error")
+                self.state = DriverState.RECOVER
+                self.stop_event.wait(1.0)
+
+        self.cleanup()
+        self.logger.info("sys.worker.terminated")        
 
 
 def main():
@@ -174,15 +220,16 @@ def main():
     logger = get_logger()
 
     worker = WeighingStationDriver(port="COM3")
+    worker_thread = threading.Thread(target=worker.run)
+    worker_thread.start()
+
     try:
-        worker.run()
+        worker_thread.join()
     except KeyboardInterrupt:
-        logger.error("sys.worker.shutdown_requested", reason="keyboard_interrupt")
-    except Exception:
-        logger.exception("sys.worker.fatal_error")
-    finally:
-        worker.close()
-        logger.info("sys.worker.stopped")
+        logger.warning("sys.main.keyboard_interrupt_detected")
+        worker.stop()
+        worker_thread.join()
+        logger.info("sys.main.shutdown_complete")
 
 
 if __name__ == "__main__":
