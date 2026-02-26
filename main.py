@@ -52,36 +52,44 @@ class HeadlessClient:
         self.gateway_id: int | None = None
 
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.event_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
         self.station_manager = WeighingStationManager(on_event=self.handle_hardware_event)
         self.main_loop = None
 
     def handle_hardware_event(self, event: BaseEvent):
-        self.main_loop.call_soon_threadsafe(asyncio.create_task, self.process_hardware_event(event))
+        self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, event)
+    
+    async def event_consumer_worker(self):
+        self.logger.info("sys.worker.event_consumer.started")
+        while True:
+            event = await self.event_queue.get()
+            try:
+                if isinstance(event, WeighingCompletedEvent):
+                    self.logger.info(
+                        "biz.weighing.completed", 
+                        event_id=event.uuid,
+                        rfid=event.rfid_card_uid, 
+                        weight=event.weight
+                    )
 
-    async def process_hardware_event(self, event: BaseEvent):
-        try:
-            if isinstance(event, WeighingCompletedEvent):
-                self.logger.info(
-                    "biz.weighing.completed", 
-                    event_id=event.uuid,
-                    rfid=event.rfid_card_uid, 
-                    weight=event.weight
-                )
+                    record = await Record.create(
+                        uuid=event.uuid,
+                        rfid_card_uid=event.rfid_card_uid,
+                        weight=event.weight,
+                        measured_at=event.timestamp,
+                    )
 
-                record = await Record.create(
-                    uuid=event.uuid,
-                    rfid_card_uid=event.rfid_card_uid,
-                    weight=event.weight,
-                    measured_at=event.timestamp,
-                )
+                    self.logger.info("biz.record.created", uuid=str(record.uuid), weight=event.weight)
 
-                self.logger.info("biz.record.created", uuid=str(record.uuid), weight=event.weight)
+                    await self.upload_queue.put(str(event.uuid))
 
-                await self.upload_queue.put(str(event.uuid))
+                    self.logger.debug("biz.record.queued_for_upload", queue_size=self.upload_queue.qsize())
 
-                self.logger.debug("biz.record.queued_for_upload", queue_size=self.upload_queue.qsize())
-        except Exception:
-            self.logger.exception("biz.record.local_save_failed", event_id=event.uuid)
+            except Exception:
+                event_id = getattr(event, 'uuid', 'unknown')
+                self.logger.exception("biz.record.local_save_failed", event_id=event_id)
+            finally:
+                self.event_queue.task_done()
 
     async def close(self):
         self.station_manager.stop_all()
@@ -286,6 +294,7 @@ class HeadlessClient:
                 )
                 
                 async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.event_consumer_worker())
                     tg.create_task(self.listen_active_ws(ws))
                     tg.create_task(heartbeat_worker.run())
                     tg.create_task(upload_worker.run())
