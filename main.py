@@ -1,7 +1,9 @@
 # main.py
 import asyncio
 import json
+import ssl
 
+import certifi
 import httpx
 import structlog
 from structlog.stdlib import get_logger
@@ -55,6 +57,8 @@ class HeadlessClient:
         self.event_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
         self.station_manager = WeighingStationManager(on_event=self.handle_hardware_event)
         self.main_loop = None
+
+        self.ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     def handle_hardware_event(self, event: BaseEvent):
         self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, event)
@@ -232,7 +236,7 @@ class HeadlessClient:
     
     async def run_provisioning_loop(self):
         self.logger.info("net.ws.provisioning.connecting", url=self.provisioning_url)
-        async with websockets.connect(self.provisioning_url) as ws:
+        async with websockets.connect(self.provisioning_url, ssl=self.ssl_context) as ws:
             self.logger.info("net.ws.provisioning.connected")
             async for message in ws:
                 await self.dispatch_provisioning(ws, message)
@@ -280,7 +284,7 @@ class HeadlessClient:
             
             await self.sync_weighing_stations()
 
-            async with websockets.connect(target_ws_url) as ws:
+            async with websockets.connect(target_ws_url, ssl=self.ssl_context) as ws:
                 self.logger.info("net.ws.active.connected")
 
                 heartbeat_worker = HeartbeatWorker(
@@ -329,7 +333,7 @@ class HeadlessClient:
 
 
 async def main():
-    client = HeadlessClient(base_url="http://localhost:8000")
+    client = HeadlessClient(base_url="https://stg.scaleledger.intedges.com")
     try:
         await client.run()
     finally:
