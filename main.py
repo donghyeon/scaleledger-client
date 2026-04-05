@@ -133,10 +133,12 @@ class HeadlessClient:
         try:
             retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
 
+            await Gateway.filter(id__not=retrieved_gateway["id"]).delete()
+
             gateway, _ = await Gateway.update_or_create(
-                mac_address=self.mac_address,
+                id=retrieved_gateway["id"],
                 defaults={
-                    "id": retrieved_gateway["id"],
+                    "mac_address": retrieved_gateway["mac_address"],
                     "hostname": retrieved_gateway["hostname"],
                     "ip_address": retrieved_gateway["ip_address"],
                     "name": retrieved_gateway["name"],
