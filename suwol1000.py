@@ -1,8 +1,9 @@
 # suwol1000.py
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
-from typing import Callable
+from typing import Callable, ClassVar, Literal
 
 import threading
 
@@ -78,9 +79,18 @@ class WeightType(StrEnum):
 
 
 @dataclass(frozen=True)
-class RequestPacket:
-    device_id: int = 0
-    command_code: CommandCode = CommandCode.DISPLAY
+class RequestPacket(ABC):
+    device_id: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] = 0
+    command_code: ClassVar[CommandCode]
+
+    @abstractmethod
+    def to_bytes(self) -> bytes:
+        pass
+
+
+@dataclass(frozen=True)
+class DisplayRequestPacket(RequestPacket):
+    command_code: ClassVar[CommandCode] = CommandCode.DISPLAY
     display_weight: Decimal = Decimal("0")
     display_plate: str = ""
     green_blink: bool = False
@@ -88,9 +98,6 @@ class RequestPacket:
     voice_code: VoiceCode = VoiceCode.NONE
 
     def to_bytes(self) -> bytes:
-        if not (0 <= self.device_id <= 9):
-            raise ValueError("Device ID must be between 0 and 9")
-        
         device_id = str(self.device_id)
 
         command_code = self.command_code
@@ -138,6 +145,36 @@ class RequestPacket:
             *reserved2_bytes,       # 4 bytes
             ETX,                    # 1 byte
         ])
+
+
+@dataclass(frozen=True)
+class PrinterRequestPacket(RequestPacket):
+    command_code: ClassVar[CommandCode] = CommandCode.PRINTER
+    copies: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
+    document_bytes: bytes = b""
+
+    def to_bytes(self) -> bytes:
+        if len(self.document_bytes) > 9999:
+            raise ValueError(f"Document exceeds 9999 bytes: {len(self.document_bytes)}")
+        
+        device_id = str(self.device_id)
+        command_code = self.command_code
+        length_bytes = f"{len(self.document_bytes):04d}".encode()
+        copies = str(self.copies)
+        document_bytes = self.document_bytes
+
+        return bytes([
+            STX,                # 1 byte
+            ord(device_id),     # 1 byte
+            ord(command_code),  # 1 byte
+            *length_bytes,      # 4 bytes
+            ord(copies),        # 1 byte
+            *document_bytes,    # len(document_bytes) bytes
+            ETX,                # 1 byte
+        ])
+
+
+# TODO(donghyeon): Define communication packets for fan/heater settings
 
 
 @dataclass(frozen=True)
@@ -236,11 +273,6 @@ class ResponsePacket:
             weight_value=weight_value,
             weight_unit=weight_unit,
         )
-
-
-# TODO(donghyeon): Define communication packets for printer output
-
-# TODO(donghyeon): Define communication packets for fan/heater settings
 
 
 class SerialClient:
@@ -361,7 +393,7 @@ class WeighingStationWorker:
         return WorkerState.IDLE
 
     def idle(self) -> WorkerState:
-        request = RequestPacket(display_weight=self.last_weight)
+        request = DisplayRequestPacket(display_weight=self.last_weight)
         response = self.client.send_and_receive(request)
         self.last_weight = response.weight_value
 
@@ -389,7 +421,7 @@ class WeighingStationWorker:
         for voice_code in voice_sequence:
             self.logger.info("hw.speaker.on", voice=voice_code.name)
             while not self.stop_event.is_set():
-                request = RequestPacket(
+                request = DisplayRequestPacket(
                     display_weight=self.last_weight,
                     display_plate=self.last_plate,
                     green_blink=True,
