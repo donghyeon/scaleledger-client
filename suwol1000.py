@@ -1,5 +1,6 @@
 # suwol1000.py
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
 from typing import Callable
 
@@ -80,7 +81,7 @@ class WeightType(StrEnum):
 class RequestPacket:
     device_id: int = 0
     command_code: CommandCode = CommandCode.DISPLAY
-    display_weight: int = 0
+    display_weight: Decimal = Decimal("0")
     display_plate: str = ""
     green_blink: bool = False
     red_blink: bool = False
@@ -94,9 +95,12 @@ class RequestPacket:
 
         command_code = self.command_code
 
-        sign = "+" if self.display_weight >= 0 else "-"
-        abs_weight = str(abs(self.display_weight))
-        display_weight_bytes = f"{sign}{abs_weight:>7.7}".encode()  # 8 bytes
+        # sign = "-" if self.display_weight.is_signed() else "+"
+        # abs_weight = str(abs(self.display_weight))
+        # display_weight_bytes = f"{sign}{abs_weight:>7.7}".encode()  # 8 bytes
+
+        # 아래 유효숫자 기반 표현형이 깔끔하지만 절대값이 999999보다 커지면 exponent 포함되며 8바이트 초과되니 주의
+        display_weight_bytes = f"{self.display_weight:=+8.6}".encode()  # 8 bytes
         display_plate_bytes = f"{self.display_plate[-6:]:>6}".encode()  # 6 bytes
 
         reserved1_bytes = b"000000"  # 6 bytes
@@ -156,7 +160,7 @@ class ResponsePacket:
     reserved: str = "0000"
     weight_status: WeightStatus = WeightStatus.STABLE
     weight_type: WeightType = WeightType.NET
-    current_weight: int = 0
+    weight_value: Decimal = Decimal("0")
     weight_unit: str = "kg"
 
     @classmethod
@@ -206,9 +210,9 @@ class ResponsePacket:
         # assert data[38] == ","
         weight_type = WeightType(data[39:41])
         # assert data[41] == ","
-        weight_sign = data[42]
-        weight_value = data[43:50].lstrip()
-        current_weight = int(f"{weight_sign}{weight_value}")
+        sign = data[42]
+        abs_weight = data[43:50].strip()
+        weight_value = Decimal(f"{sign}{abs_weight}")
         weight_unit = data[50:52]
 
         return cls(
@@ -229,7 +233,7 @@ class ResponsePacket:
             printer_status=printer_status,
             weight_status=weight_status,
             weight_type=weight_type,
-            current_weight=current_weight,
+            weight_value=weight_value,
             weight_unit=weight_unit,
         )
 
@@ -297,7 +301,7 @@ class WeighingStationWorker:
         self.retry_interval = retry_interval
 
         self.state = WorkerState.INITIALIZE
-        self.last_weight = 0
+        self.last_weight = Decimal("0")
         self.last_plate = ""
         self.stop_event = threading.Event()
 
@@ -359,7 +363,7 @@ class WeighingStationWorker:
     def idle(self) -> WorkerState:
         request = RequestPacket(display_weight=self.last_weight)
         response = self.client.send_and_receive(request)
-        self.last_weight = response.current_weight
+        self.last_weight = response.weight_value
 
         if response.rfid_card_uid != "00000000":
             self.last_plate = response.rfid_card_uid
@@ -393,7 +397,7 @@ class WeighingStationWorker:
                 )
                 try:
                     response = self.client.send_and_receive(request)
-                    self.last_weight = response.current_weight
+                    self.last_weight = response.weight_value
                     is_speaker_busy = response.voice_code != VoiceCode.NONE
                 except ValueError:
                     self.logger.warning("hw.protocol.parse_error", action="ignore_and_continue")
@@ -405,7 +409,7 @@ class WeighingStationWorker:
                     break
 
         self.logger.info("hw.weighing.completed", next_state="IDLE")
-        self.on_event(WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=self.last_weight))
+        self.on_event(WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=int(self.last_weight)))
         return WorkerState.IDLE
 
     def recover(self) -> WorkerState:
