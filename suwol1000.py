@@ -12,14 +12,14 @@ from structlog.stdlib import get_logger
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 
 
-STX = b"\x02"
-ETX = b"\x03"
+STX = 2
+ETX = 3
 
 
 class CommandCode(StrEnum):
-    DISPLAY = "D"  # 기본 표시 및 제어
-    PRINT = "P"    # 프린터 출력
-    TEMP = "T"     # 온도 설정
+    DISPLAY = "D"      # 기본 표시 및 제어
+    PRINTER = "P"      # 프린터 출력
+    TEMPERATURE = "T"  # 온도 설정
 
 
 class VoiceCode(IntEnum):
@@ -39,17 +39,11 @@ class VoiceCode(IntEnum):
 
 
 class InputCode(StrEnum):
-    NONE = "0"               # (입력 없음)
-    VEHICLE_NO = "N"         # 차량번호
-    CUSTOMER_CODE = "C"      # 거래처
-    PRODUCT_CODE = "M"       # 제품
-    REPRINT = "P"            # 전표 재발행
-
-
-class PrinterStatus(IntEnum):
-    NORMAL = 0        # 정상
-    NO_PAPER = 1      # 용지없음
-    TRANSMITTING = 2  # 전송중
+    NONE = "0"           # (입력 없음)
+    VEHICLE_NO = "N"     # 차량번호
+    CUSTOMER_CODE = "C"  # 거래처
+    PRODUCT_CODE = "M"   # 제품
+    REPRINT = "P"        # 전표 재발행
 
 
 class RelayCode(IntFlag):
@@ -64,7 +58,22 @@ class RelayCode(IntFlag):
     RELAY8 = 1 << 7  # Relay 8: 모름
 
 
-# TODO(donghyeon): Define scale status codes
+class PrinterStatus(IntEnum):
+    NORMAL = 0        # 정상
+    NO_PAPER = 1      # 용지없음
+    TRANSMITTING = 2  # 전송중
+
+
+class WeightStatus(StrEnum):
+    STABLE = "ST"    # 안정 (Stable)
+    UNSTABLE = "US"  # 불안정 (Unstable)
+    OVERLOAD = "OL"  # 과적 (Overload)
+
+
+class WeightType(StrEnum):
+    NET = "NT"    # 순중량 (Net)
+    GROSS = "GS"  # 총중량 (Gross)
+    TARE = "TR"   # 용기중량 (Tare)
 
 
 @dataclass(frozen=True)
@@ -78,16 +87,19 @@ class RequestPacket:
     voice_code: VoiceCode = VoiceCode.NONE
 
     def to_bytes(self) -> bytes:
-        device_id_str = str(self.device_id)[-1].encode()
+        if not (0 <= self.device_id <= 9):
+            raise ValueError("Device ID must be between 0 and 9")
+        
+        device_id = str(self.device_id)
 
-        command_code_str = self.command_code.encode()
+        command_code = self.command_code
 
         sign = "+" if self.display_weight >= 0 else "-"
         abs_weight = str(abs(self.display_weight))
-        display_weight_str=f"{sign}{abs_weight:>7.7}".encode()
-        display_plate_str = f"{self.display_plate[-6:]:>6}".encode()
+        display_weight_bytes = f"{sign}{abs_weight:>7.7}".encode()  # 8 bytes
+        display_plate_bytes = f"{self.display_plate[-6:]:>6}".encode()  # 6 bytes
 
-        reserved1_str = b" " * 6
+        reserved1_bytes = b"000000"  # 6 bytes
 
         relay_value = (
             RelayCode.GREEN * self.green_blink |
@@ -104,24 +116,24 @@ class RequestPacket:
         # ascii 코드 순서 형태: 0, 1, ..., 9, :, ;, <, =, >, ?
         high_nibble = (relay_value & 0b11110000) >> 4
         low_nibble  = (relay_value & 0b00001111)
-        relay_str = bytes([high_nibble + ord("0"), low_nibble + ord("0")])
+        relay_bytes = bytes([high_nibble + ord("0"), low_nibble + ord("0")])  # 2 bytes
 
-        voice_index_str = f"{self.voice_code:02d}".encode()
+        voice_index_bytes = f"{self.voice_code:02d}".encode()  # 2 bytes
 
-        reserved2_str = b" " * 4
+        reserved2_bytes = b"0000"  # 4 bytes
 
-        return (
-            STX +                 # 1 byte
-            device_id_str +       # 1 byte
-            command_code_str +    # 1 byte
-            display_weight_str +  # 8 bytes
-            display_plate_str +   # 6 bytes
-            reserved1_str +       # 6 bytes
-            relay_str +           # 2 bytes
-            voice_index_str +     # 2 bytes
-            reserved2_str +       # 4 bytes
-            ETX                   # 1 byte
-        )
+        return bytes([
+            STX,                    # 1 byte
+            ord(device_id),         # 1 byte
+            ord(command_code),      # 1 byte
+            *display_weight_bytes,  # 8 bytes
+            *display_plate_bytes,   # 6 bytes
+            *reserved1_bytes,       # 6 bytes
+            *relay_bytes,           # 2 bytes
+            *voice_index_bytes,     # 2 bytes
+            *reserved2_bytes,       # 4 bytes
+            ETX,                    # 1 byte
+        ])
 
 
 @dataclass(frozen=True)
@@ -141,16 +153,20 @@ class ResponsePacket:
     fan_trigger_temp: int = 30
     heater_trigger_temp: int = 5
     printer_status: PrinterStatus = PrinterStatus.NORMAL
-    is_weight_stable: bool = False
+    reserved: str = "0000"
+    weight_status: WeightStatus = WeightStatus.STABLE
+    weight_type: WeightType = WeightType.NET
     current_weight: int = 0
+    weight_unit: str = "kg"
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "ResponsePacket":
-        data = raw.decode()
-        if len(data) != 53:
-            raise ValueError(f"Invalid response packet length: {len(data)} bytes")
-        if data[0] != STX.decode() or data[-1] != ETX.decode():
+        if len(raw) != 53:
+            raise ValueError(f"Invalid response packet length: {len(raw)} bytes")
+        if raw[0] != STX or raw[-1] != ETX:
             raise ValueError("Invalid STX/ETX")
+
+        data = raw.decode(errors="replace")
 
         device_id = int(data[1])
 
@@ -184,8 +200,16 @@ class ResponsePacket:
 
         printer_status = PrinterStatus(int(data[31]))
 
-        is_weight_stable = data[36:38] == "ST"
-        current_weight = int(data[42] + data[43:50].lstrip())
+        reserved = data[32:36]
+
+        weight_status = WeightStatus(data[36:38])
+        # assert data[38] == ","
+        weight_type = WeightType(data[39:41])
+        # assert data[41] == ","
+        weight_sign = data[42]
+        weight_value = data[43:50].lstrip()
+        current_weight = int(f"{weight_sign}{weight_value}")
+        weight_unit = data[50:52]
 
         return cls(
             device_id=device_id,
@@ -203,8 +227,10 @@ class ResponsePacket:
             fan_trigger_temp=fan_trigger_temp,
             heater_trigger_temp=heater_trigger_temp,
             printer_status=printer_status,
-            is_weight_stable=is_weight_stable,
+            weight_status=weight_status,
+            weight_type=weight_type,
             current_weight=current_weight,
+            weight_unit=weight_unit,
         )
 
 
@@ -241,8 +267,11 @@ class SerialClient:
                 pass
 
     def send_and_receive(self, request: RequestPacket) -> ResponsePacket:
+        if self.serial is None or not self.serial.is_open:
+            raise serial.SerialException("Serial port is not connected")
+        
         self.serial.write(request.to_bytes())
-        response = self.serial.read_until(expected=ETX)
+        response = self.serial.read_until(expected=bytes([ETX]))
         return ResponsePacket.from_bytes(response)
 
 
@@ -298,7 +327,7 @@ class WeighingStationWorker:
                         self.state = self.recover()
             
             except ValueError:
-                self.logger.warning("hw.protocol.parse_error")
+                self.logger.exception("hw.protocol.parse_error")
                 self.stop_event.wait(self.polling_interval)
                 self.state = WorkerState.IDLE
 
