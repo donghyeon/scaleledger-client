@@ -8,6 +8,7 @@ import httpx
 import structlog
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
+from websockets.exceptions import ConnectionClosed
 import websockets
 
 from api import APIClient, AuthDegradedError
@@ -58,7 +59,9 @@ class HeadlessClient:
         self.station_manager = WeighingStationManager(on_event=self.handle_hardware_event)
         self.main_loop = None
 
-        self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+        self.ws_kwargs = {}
+        if self.ws_url.startswith("wss://"):
+            self.ws_kwargs["ssl"] = ssl.create_default_context(cafile=certifi.where())
 
     def handle_hardware_event(self, event: BaseEvent):
         self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, event)
@@ -224,7 +227,7 @@ class HeadlessClient:
                 self.logger.warning("sys.loop.auth_degraded", action="wipe_and_retry")
                 await self.wipe_local_auth()
 
-            except* (websockets.exceptions.ConnectionClosed, OSError):
+            except* (ConnectionClosed, OSError):
                 self.logger.exception("net.ws.connection_lost", retry_in=self.retry_interval)
                 await asyncio.sleep(self.retry_interval)
 
@@ -238,7 +241,7 @@ class HeadlessClient:
     
     async def run_provisioning_loop(self):
         self.logger.info("net.ws.provisioning.connecting", url=self.provisioning_url)
-        async with websockets.connect(self.provisioning_url, ssl=self.ssl_context) as ws:
+        async with websockets.connect(self.provisioning_url, **self.ws_kwargs) as ws:
             self.logger.info("net.ws.provisioning.connected")
             async for message in ws:
                 await self.dispatch_provisioning(ws, message)
@@ -286,7 +289,7 @@ class HeadlessClient:
             
             await self.sync_weighing_stations()
 
-            async with websockets.connect(target_ws_url, ssl=self.ssl_context) as ws:
+            async with websockets.connect(target_ws_url, **self.ws_kwargs) as ws:
                 self.logger.info("net.ws.active.connected")
 
                 heartbeat_worker = HeartbeatWorker(
