@@ -1,6 +1,10 @@
 # printer.py
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Self
+import uuid
 
 
 ESC = 0x1B  # 27
@@ -140,3 +144,66 @@ class EscPosBuilder:
 
     def build(self) -> bytes:
         return bytes(self._buffer)
+
+
+@dataclass(frozen=True)
+class Receipt:
+    record_uuid: uuid.UUID
+    rfid_card_uid: str
+    producer_name: str
+    species_name: str
+    weight: Decimal
+    measured_at: datetime
+
+
+class ReceiptTemplate:
+    @staticmethod
+    def render(receipt: Receipt) -> bytes:
+        short_uuid = str(receipt.record_uuid).split("-")[0].upper()
+
+        builder = (
+            EscPosBuilder()
+            
+            # Header
+            .set_align(Alignment.CENTER)
+            .set_quadruple(True)
+            .set_bold(True)
+            .add_text("계량증명서")
+            .set_quadruple(False)
+            .set_bold(False)
+            .feed_lines(2)
+            
+            # Meta Data
+            .set_align(Alignment.LEFT)
+            .add_separator("=", 42)
+            .add_kv("발행일시", receipt.measured_at.strftime("%Y-%m-%d %H:%M:%S"))
+            .add_kv("전표번호", short_uuid)
+            .add_separator("-", 42)
+            
+            # Body
+            .feed_lines(1)
+            .add_kv("생산자", receipt.producer_name)
+            .add_kv("품목", receipt.species_name)
+            .add_kv("카드번호", receipt.rfid_card_uid)
+            .feed_lines(1)
+            
+            # Weight
+            .set_align(Alignment.RIGHT)
+            .set_quadruple(True)
+            .set_bold(True)
+            .add_text(f"{receipt.weight:,} kg")
+            .feed_lines(2)
+            .set_quadruple(False)
+            .set_bold(False)
+            
+            # Footer
+            .set_align(Alignment.CENTER)
+            .add_separator("=", 42)
+            .feed_lines(2)
+            .add_text("ScaleLedger System")
+            .feed_lines(2)
+            .cut()
+            .feed_lines(5, now=True)
+        )
+        
+        return builder.build()
