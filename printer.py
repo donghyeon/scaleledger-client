@@ -104,6 +104,15 @@ class EscPosBuilder:
         self._buffer.extend(text.encode("cp949", errors="replace"))
         return self
     
+    def add_kv(self, key: str, value: str, max_col: int = 42) -> Self:
+        k_bytes = len(key.encode("cp949", errors="replace"))
+        v_bytes = len(value.encode("cp949", errors="replace"))
+        spaces = max(1, max_col - k_bytes - v_bytes)
+        
+        line = f"{key}{' ' * spaces}{value}"
+        self.add_text(line).feed_lines(1)
+        return self
+
     def feed_lines(self, lines: int = 1, now: bool = False) -> Self:
         if now:
             self._buffer.extend(EscPosCommand.PRINT_AND_FEED + bytes([lines]))
