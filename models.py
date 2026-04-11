@@ -51,3 +51,36 @@ class Record(Model):
     
     def __repr__(self):
         return f"<Record(rfid_card_uid={self.rfid_card_uid}, weight={self.weight}, measured_at={self.measured_at})>"
+
+
+class Species(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=100)
+
+    class Meta:
+        table = "species"
+
+
+class Producer(Model):
+    id = fields.IntField(pk=True)
+    uuid = fields.UUIDField(unique=True)
+    name = fields.CharField(max_length=100)
+    phone = fields.CharField(max_length=20, null=True)
+    created_at = fields.DatetimeField()
+
+    class Meta:
+        table = "producer"
+
+
+class RFIDCard(Model):
+    id = fields.IntField(pk=True)
+    uuid = fields.UUIDField(unique=True)
+    uid = fields.CharField(max_length=50, unique=True)
+    producer = fields.ForeignKeyField("models.Producer", related_name="rfid_cards")
+    species = fields.ForeignKeyField("models.Species", related_name="rfid_cards")
+    is_active = fields.BooleanField(default=True)
+    issued_at = fields.DatetimeField()
+    last_used_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        table = "rfid_card"

@@ -56,3 +56,21 @@ class APIClient:
         response = await self.client.post("weighing/api/records/", json=payload, headers=headers)
         response.raise_for_status()
         return response.json()
+
+    async def fetch_species(self, access_token: str) -> List[Dict[str, Any]]:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        response = await self.client.get("market/api/species/", headers=headers)
+        response.raise_for_status()
+        return response.json()
+    
+    async def fetch_producers(self, access_token: str) -> List[Dict[str, Any]]:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        response = await self.client.get("market/api/producers/", headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def fetch_rfid_cards(self, access_token: str) -> List[Dict[str, Any]]:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        response = await self.client.get("market/api/rfid-cards/", headers=headers)
+        response.raise_for_status()
+        return response.json()

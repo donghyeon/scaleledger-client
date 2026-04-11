@@ -8,13 +8,14 @@ import httpx
 import structlog
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
+from tortoise.transactions import in_transaction
 from websockets.exceptions import ConnectionClosed
 import websockets
 
 from api import APIClient, AuthDegradedError
 from events import BaseEvent, WeighingCompletedEvent
 from managers import WeighingStationManager
-from models import Gateway, Record, WeighingStation
+from models import Gateway, Record, WeighingStation, Species, Producer, RFIDCard
 from utils import get_hostname, get_ip_address, get_mac_address, scan_peripherals
 from workers import HeartbeatWorker, RecordUploadWorker
 
@@ -206,6 +207,52 @@ class HeadlessClient:
             self.logger.warning("net.api.sync_stations.network_error")
         except Exception:
             self.logger.exception("sys.sync.weighing_stations.fatal_error")
+    
+    async def sync_market_data(self):
+        self.logger.info("sys.sync.market_data.started")
+        try:
+            species_data = await self.api_client.fetch_species(self.access_token)
+            producers_data = await self.api_client.fetch_producers(self.access_token)
+            rfid_cards_data = await self.api_client.fetch_rfid_cards(self.access_token)
+
+            async with in_transaction():
+                await RFIDCard.all().delete()
+                await Producer.all().delete()
+                await Species.all().delete()
+
+                await Species.bulk_create([Species(**s) for s in species_data])
+                await Producer.bulk_create([Producer(**p) for p in producers_data])
+                
+                rfid_cards = []
+                for data in rfid_cards_data:
+                    rfid_cards.append(RFIDCard(
+                        id=data["id"],
+                        uuid=data["uuid"],
+                        uid=data["uid"],
+                        producer_id=data["producer"],
+                        species_id=data["species"],
+                        is_active=data["is_active"],
+                        issued_at=data["issued_at"],
+                        last_used_at=data.get("last_used_at")
+                    ))
+                await RFIDCard.bulk_create(rfid_cards)
+
+            self.logger.info(
+                "sys.sync.market_data.completed", 
+                species=len(species_data), 
+                producers=len(producers_data), 
+                rfids=len(rfid_cards_data)
+            )
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                self.logger.error("net.api.sync_market.auth_rejected", status=e.response.status_code)
+                raise AuthDegradedError("Sync market data auth failed")
+            self.logger.error("net.api.sync_market.server_error", status=e.response.status_code)
+        except httpx.RequestError:
+            self.logger.warning("net.api.sync_market.network_error")
+        except Exception:
+            self.logger.exception("sys.sync.market_data.fatal_error")
 
     async def run(self):
         setup_logging()
@@ -286,6 +333,8 @@ class HeadlessClient:
             
             if unsynced_records:
                 self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
+            
+            await self.sync_market_data()
             
             await self.sync_weighing_stations()
 
