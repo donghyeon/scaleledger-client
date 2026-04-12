@@ -149,6 +149,8 @@ class EscPosBuilder:
 @dataclass(frozen=True)
 class Receipt:
     record_uuid: uuid.UUID
+    gateway_name: str
+    station_name: str
     rfid_card_uid: str
     producer_name: str
     species_name: str
@@ -178,12 +180,14 @@ class ReceiptTemplate:
             .add_separator("=", 42)
             .add_kv("발행일시", receipt.measured_at.strftime("%Y-%m-%d %H:%M:%S"))
             .add_kv("전표번호", short_uuid)
+            .add_kv("계 량 기", receipt.gateway_name)
+            .add_kv("계 근 대", receipt.station_name)
             .add_separator("-", 42)
             
             # Body
             .feed_lines(1)
-            .add_kv("생산자", receipt.producer_name)
-            .add_kv("품목", receipt.species_name)
+            .add_kv("생산자명", receipt.producer_name)
+            .add_kv("품 목 명", receipt.species_name)
             .add_kv("카드번호", receipt.rfid_card_uid)
             .feed_lines(1)
             
