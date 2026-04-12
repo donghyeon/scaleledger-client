@@ -67,12 +67,14 @@ class PrinterStatus(IntEnum):
 
 
 class WeightStatus(StrEnum):
+    NONE = "00"      # 신호 없음
     STABLE = "ST"    # 안정 (Stable)
     UNSTABLE = "US"  # 불안정 (Unstable)
     OVERLOAD = "OL"  # 과적 (Overload)
 
 
 class WeightType(StrEnum):
+    NONE = "00"   # 신호 없음
     NET = "NT"    # 순중량 (Net)
     GROSS = "GS"  # 총중량 (Gross)
     TARE = "TR"   # 용기중량 (Tare)
@@ -151,7 +153,7 @@ class DisplayRequestPacket(RequestPacket):
 class PrinterRequestPacket(RequestPacket):
     command_code: ClassVar[CommandCode] = CommandCode.PRINTER
     copies: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
-    document_bytes: bytes = b""
+    document_bytes: bytes = bytes()
 
     def to_bytes(self) -> bytes:
         if len(self.document_bytes) > 9999:
