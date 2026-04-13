@@ -1,6 +1,7 @@
 # suwol1000.py
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import dataclasses
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
 from typing import Callable, ClassVar, Literal
@@ -317,7 +318,9 @@ class WorkerState(Enum):
     INITIALIZE = auto()
     CONNECT = auto()
     IDLE = auto()
+    VERIFY = auto()
     MEASURE = auto()
+    PRINT = auto()
     RECOVER = auto()
 
 
@@ -326,17 +329,22 @@ class WeighingStationWorker:
         self,
         serial_client: SerialClient,
         on_event: Callable[[BaseEvent], None] | None = None,
+        rfid_validator: Callable[[RFIDTaggedEvent], bool] | None = None,
+        receipt_builder: Callable[[WeighingCompletedEvent], bytes | None] | None = None,
         polling_interval: float = 0.1,
         retry_interval: float = 1.0,
     ):
         self.client = serial_client
         self.on_event = on_event or print
+        self.rfid_validator = rfid_validator or (lambda _: True)
+        self.receipt_builder = receipt_builder
         self.polling_interval = polling_interval
         self.retry_interval = retry_interval
 
         self.state = WorkerState.INITIALIZE
         self.last_weight = Decimal("0")
         self.last_plate = ""
+        self.last_event: BaseEvent | None = None
         self.stop_event = threading.Event()
 
         self.logger = get_logger().bind(port=serial_client.port)
@@ -359,8 +367,12 @@ class WeighingStationWorker:
                         self.state = self.connect()
                     case WorkerState.IDLE:
                         self.state = self.idle()
+                    case WorkerState.VERIFY:
+                        self.state = self.verify()
                     case WorkerState.MEASURE:
                         self.state = self.measure()
+                    case WorkerState.PRINT:
+                        self.state = self.print()
                     case WorkerState.RECOVER:
                         self.state = self.recover()
             
@@ -383,6 +395,30 @@ class WeighingStationWorker:
 
         self.client.disconnect()
         self.logger.info("sys.worker.terminated")
+    
+    def poll_until_voice_ends(self, base_request: DisplayRequestPacket) -> ResponsePacket | None:
+        response = None
+
+        if base_request.voice_code != VoiceCode.NONE:
+            self.logger.info("hw.speaker.on", voice_code=base_request.voice_code.name)
+
+        voice_sent = False
+        is_speaker_busy = True
+        while (is_speaker_busy or not voice_sent) and not self.stop_event.is_set():
+            request = dataclasses.replace(
+                base_request,
+                display_weight=self.last_weight,
+                voice_code=VoiceCode.NONE if voice_sent else base_request.voice_code,
+            )
+            try:
+                response = self.client.send_and_receive(request)
+                self.last_weight = response.weight_value
+                is_speaker_busy = response.voice_code != VoiceCode.NONE
+                voice_sent |= response.voice_code == base_request.voice_code
+            except ValueError:
+                self.logger.warning("hw.protocol.parse_error", action="ignore_and_continue")
+            self.stop_event.wait(self.polling_interval)
+        return response
 
     def initialize(self) -> WorkerState:
         self.logger.info("sys.worker.startup", next_state="CONNECT")
@@ -406,44 +442,80 @@ class WeighingStationWorker:
                 rfid_card_uid=response.rfid_card_uid,
                 next_state="MEASURE",
             )
-            self.on_event(RFIDTaggedEvent(rfid_card_uid=response.rfid_card_uid))
-            return WorkerState.MEASURE
+            self.last_event = RFIDTaggedEvent(rfid_card_uid=response.rfid_card_uid)
+            self.on_event(self.last_event)
+            return WorkerState.VERIFY
 
         self.stop_event.wait(self.polling_interval)
         return WorkerState.IDLE
     
+    def verify(self) -> WorkerState:
+        self.logger.info("biz.rfid_card.verifying", rfid_card_uid=self.last_plate)
+        request = DisplayRequestPacket(
+            display_weight=self.last_weight,
+            display_plate=self.last_plate,
+            voice_code=VoiceCode.PLEASE_WAIT,
+        )
+        response = self.poll_until_voice_ends(request)
+        if self.stop_event.is_set():
+            return WorkerState.IDLE
+        
+        if not isinstance(self.last_event, RFIDTaggedEvent):
+            self.logger.error("sys.worker.invalid_event_type")
+            return WorkerState.IDLE
+
+        is_valid = self.rfid_validator(self.last_event)
+        if not is_valid:
+            self.logger.info("biz.rfid_card.unregistered", next_state="IDLE")
+            request = DisplayRequestPacket(
+                display_weight=self.last_weight,
+                display_plate=self.last_plate,
+                red_blink=True,
+                voice_code=VoiceCode.UNREGISTERED_CARD,
+            )
+            response = self.poll_until_voice_ends(request)
+            return WorkerState.IDLE
+
+        self.logger.info("biz.rfid_card.verified", next_state="MEASURE")
+        return WorkerState.MEASURE
+    
     def measure(self) -> WorkerState:
-        voice_sequence = [
-            VoiceCode.PLEASE_WAIT,
-            VoiceCode.WEIGHT_COMPLETE,
-            VoiceCode.THANK_YOU,
-        ]
+        self.logger.info("hw.weighing.started")
+        self.last_event = WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=int(self.last_weight))
+        self.on_event(self.last_event)
+        self.logger.info("hw.weighing.completed", next_state="PRINT")
 
-        is_speaker_busy = False
-        for voice_code in voice_sequence:
-            self.logger.info("hw.speaker.on", voice=voice_code.name)
-            while not self.stop_event.is_set():
-                request = DisplayRequestPacket(
-                    display_weight=self.last_weight,
-                    display_plate=self.last_plate,
-                    green_blink=True,
-                    voice_code=VoiceCode.NONE if is_speaker_busy else voice_code,
-                )
-                try:
-                    response = self.client.send_and_receive(request)
-                    self.last_weight = response.weight_value
-                    is_speaker_busy = response.voice_code != VoiceCode.NONE
-                except ValueError:
-                    self.logger.warning("hw.protocol.parse_error", action="ignore_and_continue")
-                    self.stop_event.wait(self.polling_interval)
-                    continue
+        request = DisplayRequestPacket(
+            display_weight=self.last_weight,
+            display_plate=self.last_plate,
+            green_blink=True,
+            voice_code=VoiceCode.WEIGHT_COMPLETE,
+        )
+        response = self.poll_until_voice_ends(request)
+        return WorkerState.PRINT
+    
+    def print(self) -> WorkerState:
+        receipt_bytes = None
+        if self.receipt_builder is not None and isinstance(self.last_event, WeighingCompletedEvent):
+            receipt_bytes = self.receipt_builder(self.last_event)
+        
+        if receipt_bytes:
+            self.logger.info("hw.printer.command.sending", payload_length = len(receipt_bytes))
+            request = PrinterRequestPacket(document_bytes=receipt_bytes)
+            response = self.client.send_and_receive(request)
+            self.last_weight = response.weight_value
 
-                self.stop_event.wait(self.polling_interval)
-                if not is_speaker_busy:
-                    break
 
-        self.logger.info("hw.weighing.completed", next_state="IDLE")
-        self.on_event(WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=int(self.last_weight)))
+        request = DisplayRequestPacket(
+            display_weight=self.last_weight,
+            display_plate=self.last_plate,
+            green_blink=True,
+            voice_code=VoiceCode.THANK_YOU,
+        )
+        response = self.poll_until_voice_ends(request)
+
+        self.last_plate = ""
+        self.last_event = None
         return WorkerState.IDLE
 
     def recover(self) -> WorkerState:
