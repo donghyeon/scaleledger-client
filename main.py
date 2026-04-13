@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 import websockets
 
 from api import APIClient, AuthDegradedError
+from cache import MarketDataCache, RFIDInfo
 from events import BaseEvent, WeighingCompletedEvent
 from managers import WeighingStationManager
 from models import Gateway, Record, WeighingStation, Species, Producer, RFIDCard
@@ -55,14 +56,19 @@ class HeadlessClient:
         self.access_token: str | None = None
         self.gateway_id: int | None = None
 
+        self.market_cache = MarketDataCache()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
         self.event_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
-        self.station_manager = WeighingStationManager(on_event=self.handle_hardware_event)
+        self.station_manager = WeighingStationManager(
+            on_event=self.handle_hardware_event,
+            market_cache = self.market_cache,
+        )
         self.main_loop = None
 
         self.ws_kwargs = {}
         if self.ws_url.startswith("wss://"):
             self.ws_kwargs["ssl"] = ssl.create_default_context(cafile=certifi.where())
+
 
     def handle_hardware_event(self, event: BaseEvent):
         self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, event)
@@ -254,6 +260,30 @@ class HeadlessClient:
         except Exception:
             self.logger.exception("sys.sync.market_data.fatal_error")
 
+    async def refresh_market_cache(self):
+        self.logger.info("sys.cache.refresh.started")
+        try:
+            rfid_cache_data = {}
+            
+            active_cards = await RFIDCard.all().select_related("producer", "species")
+            
+            for card in active_cards:
+                rfid_cache_data[card.uid] = RFIDInfo(
+                    is_active=card.is_active,
+                    producer_name=card.producer.name,
+                    species_name=card.species.name
+                )
+            
+            self.market_cache.update_rfid_data(rfid_cache_data)
+
+            gateway = await Gateway.get(id=self.gateway_id)
+            self.market_cache.gateway_name = gateway.name
+
+            self.logger.info("sys.cache.refresh.completed", cached_rfid_count=len(rfid_cache_data))
+            
+        except Exception:
+            self.logger.exception("sys.cache.refresh.failed")
+
     async def run(self):
         setup_logging()
 
@@ -335,6 +365,8 @@ class HeadlessClient:
                 self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
             
             await self.sync_market_data()
+
+            await self.refresh_market_cache()
             
             await self.sync_weighing_stations()
 

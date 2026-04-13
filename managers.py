@@ -5,7 +5,9 @@ from typing import Callable, Dict
 
 from structlog.stdlib import get_logger
 
-from events import BaseEvent
+from cache import MarketDataCache
+from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
+from printer import Receipt, ReceiptTemplate
 from models import WeighingStation
 from suwol1000 import SerialClient, WeighingStationWorker
 
@@ -18,8 +20,9 @@ class StationRuntime:
 
 
 class WeighingStationManager:
-    def __init__(self, on_event: Callable[[BaseEvent], None]):
+    def __init__(self, on_event: Callable[[BaseEvent], None], market_cache: MarketDataCache):
         self.on_event = on_event
+        self.market_cache = market_cache
         self.workers: Dict[int, StationRuntime] = {}
         self.logger = get_logger()
 
@@ -52,10 +55,37 @@ class WeighingStationManager:
 
     def start_worker(self, station: WeighingStation):
         self.logger.info("sys.manager.station.start", station_id=station.id, port=station.serial_port)
+        
+        def validate_rfid(event: RFIDTaggedEvent) -> bool:
+            info = self.market_cache.get_rfid_info(event.rfid_card_uid)
+            if not info:
+                return False
+            return info.is_active
+
+        def build_receipt(event: WeighingCompletedEvent) -> bytes | None:
+            info = self.market_cache.get_rfid_info(event.rfid_card_uid)
+            if not info:
+                return None
+                
+            receipt = Receipt(
+                record_uuid=event.uuid,
+                gateway_name=self.market_cache.gateway_name,
+                station_name=station.name,
+                rfid_card_uid=event.rfid_card_uid,
+                producer_name=info.producer_name,
+                species_name=info.species_name,
+                weight=event.weight,
+                measured_at=event.timestamp
+            )
+            return ReceiptTemplate.render(receipt)
+
         worker = WeighingStationWorker(
             serial_client=SerialClient(port=station.serial_port),
             on_event=self.on_event,
+            rfid_validator=validate_rfid,
+            receipt_builder=build_receipt
         )
+
         thread = threading.Thread(target=worker.run, name=f"WeighingStation-{station.id}-{station.serial_port}", daemon=True)
         thread.start()
         self.workers[station.id] = StationRuntime(worker=worker, thread=thread, port=station.serial_port)
