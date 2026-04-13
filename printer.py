@@ -11,12 +11,18 @@ ESC = 0x1B  # 27
 FS  = 0x1C  # 28
 GS  = 0x1D  # 29
 LF  = 0x0A  # 10
+FF  = 0x0C  # 12
+CAN = 0x18  # 24
 
 
 class EscPosCommand:
     INITIALIZE = bytes([ESC, ord("@")])
     LINE_FEED = bytes([LF])
     PRINT_AND_FEED = bytes([ESC, ord("d")])
+
+    PAGE_MODE = bytes([ESC, ord("L")])
+    PRINT_PAGE = bytes([ESC, FF])
+    CANCEL_PAGE = bytes([CAN])
     
     KOREAN_ON = bytes([FS, ord("&")])
     KOREAN_OFF = bytes([FS, ord(".")])
@@ -28,14 +34,14 @@ class EscPosCommand:
     BOLD_ON = bytes([ESC, ord("E"), 1])
     BOLD_OFF = bytes([ESC, ord("E"), 0])
 
-    UNDERLINE_ON = bytes([ESC, ord("-"), 1]) + bytes([FS, ord("-"), 1])
-    UNDERLINE_OFF = bytes([ESC, ord("-"), 0]) + bytes([FS, ord("-"), 0])
+    UNDERLINE_ON = bytes([ESC, ord("-"), 1])  #+ bytes([FS, ord("-"), 1])
+    UNDERLINE_OFF = bytes([ESC, ord("-"), 0])  #+ bytes([FS, ord("-"), 0])
     
-    TEXT_NORMAL = bytes([GS, ord("!"), 0x00]) + bytes([FS, ord("W"), 0])
-    TEXT_DOUBLE = bytes([GS, ord("!"), 0x11]) + bytes([FS, ord("W"), 1])
+    TEXT_NORMAL = bytes([GS, ord("!"), 0x00])  #+ bytes([FS, ord("W"), 0])
+    TEXT_DOUBLE = bytes([GS, ord("!"), 0x11])  #+ bytes([FS, ord("W"), 1])
 
-    FULL_CUT = bytes([ESC, ord("i")])
-    PARTIAL_CUT = bytes([ESC, ord("m")])
+    FULL_CUT = bytes([GS, ord("V"), 0])
+    PARTIAL_CUT = bytes([GS, ord("V"), 1])
 
     BARCODE_2D = bytes([GS, ord("("), ord("k")])
 
@@ -72,9 +78,10 @@ class ECL(StrEnum):
 class EscPosBuilder:
     def __init__(self):
         self._buffer = bytearray()
+        self._buffer.extend(EscPosCommand.CANCEL_PAGE)
         self._buffer.extend(EscPosCommand.INITIALIZE)
     
-    def set_kanji_mode(self, on: bool) -> Self:
+    def set_kanji_mode(self, on: bool = True) -> Self:
         cmd = EscPosCommand.KOREAN_ON if on else EscPosCommand.KOREAN_OFF
         self._buffer.extend(cmd)
         return self
@@ -129,7 +136,7 @@ class EscPosBuilder:
         self.add_text(separator_line).feed_lines(1)
         return self
     
-    def add_qr_code(self, data: str, size: int = 6, ecl: ECL = ECL.M) -> Self:
+    def add_qr_code(self, data: str, size: int = 3, ecl: ECL = ECL.M) -> Self:
         self._buffer.extend(QrCodeCommand.MODEL.encode(bytes([ord("2"), 0])))
         self._buffer.extend(QrCodeCommand.SIZE.encode(bytes([size])))
         self._buffer.extend(QrCodeCommand.ECL.encode(bytes([ord(ecl)])))
@@ -137,8 +144,14 @@ class EscPosBuilder:
         self._buffer.extend(QrCodeCommand.PRINT.encode(bytes([ord("0")])))
         return self
 
-    def cut(self, partial: bool = False) -> Self:
+    def cut(self, partial: bool = False, pre_feed_lines: int = 4) -> Self:
+        self.feed_lines(pre_feed_lines, now=True)
         cmd = EscPosCommand.PARTIAL_CUT if partial else EscPosCommand.FULL_CUT
+        self._buffer.extend(cmd)
+        return self
+    
+    def print(self) -> Self:
+        cmd = EscPosCommand.PRINT_PAGE
         self._buffer.extend(cmd)
         return self
 
@@ -165,12 +178,12 @@ class ReceiptTemplate:
 
         builder = (
             EscPosBuilder()
-            
+
             # Header
             .set_align(Alignment.CENTER)
             .set_quadruple(True)
             .set_bold(True)
-            .add_text("계량증명서")
+            .add_text("계 량 전 표")
             .set_quadruple(False)
             .set_bold(False)
             .feed_lines(2)
@@ -185,29 +198,25 @@ class ReceiptTemplate:
             .add_separator("-", 42)
             
             # Body
-            .feed_lines(1)
             .add_kv("생산자명", receipt.producer_name)
             .add_kv("품 목 명", receipt.species_name)
             .add_kv("카드번호", receipt.rfid_card_uid)
-            .feed_lines(1)
             
             # Weight
             .set_align(Alignment.RIGHT)
             .set_quadruple(True)
             .set_bold(True)
             .add_text(f"{receipt.weight:,} kg")
-            .feed_lines(2)
+            .feed_lines(1)
             .set_quadruple(False)
             .set_bold(False)
             
             # Footer
             .set_align(Alignment.CENTER)
             .add_separator("=", 42)
-            .feed_lines(2)
-            .add_text("ScaleLedger System")
-            .feed_lines(2)
+            .add_text("SUWOL ScaleLedger System")
+
             .cut()
-            .feed_lines(5, now=True)
         )
         
         return builder.build()
